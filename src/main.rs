@@ -11,16 +11,35 @@ use tokio::task::JoinSet;
 use solana_client::rpc_client::RpcClient;
 use std::sync::Arc;
 use Skyscope_Solana_MEV_Bot::arbitrage::strategies::{optimism_tx_strategy, run_arbitrage_strategy, sorted_interesting_path_strategy};
+use std::sync::Arc;
+use clap::Parser;
+use Skyscope_Solana_MEV_Bot::arbitrage::strategies::{optimism_tx_strategy, run_arbitrage_strategy, sorted_interesting_path_strategy};
 use Skyscope_Solana_MEV_Bot::common::constants::BotInstanceConfig;
 use Skyscope_Solana_MEV_Bot::common::database::insert_vec_swap_path_selected_collection;
+use Skyscope_Solana_MEV_Bot::common::qr_utils::display_funding_info;
 use Skyscope_Solana_MEV_Bot::common::types::InputVec;
 use Skyscope_Solana_MEV_Bot::markets::pools::load_all_pools;
+use solana_sdk::native_token::sol_to_lamports; // For converting SOL to lamports
+use std::io::{self, Write as IoWrite}; // For stdin/stdout
 use Skyscope_Solana_MEV_Bot::transactions::create_transaction::{create_ata_extendlut_transaction, ChainType, SendOrSimulate};
 use Skyscope_Solana_MEV_Bot::{common::constants::Env, transactions::create_transaction::create_and_send_swap_transaction};
 use Skyscope_Solana_MEV_Bot::common::utils::{from_str, get_tokens_infos, setup_logger};
 use Skyscope_Solana_MEV_Bot::arbitrage::types::{SwapPathResult, SwapPathSelected, SwapRouteSimulation, TokenInArb, TokenInfos, VecSwapPathSelected};
 use Skyscope_Solana_MEV_Bot::markets::types::Dex as DexType; // Renamed to avoid conflict
 use rust_socketio::{Payload, asynchronous::{Client, ClientBuilder},};
+
+/// CLI arguments
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct CliArgs {
+    /// Display funding QR codes for configured bot instances and exit
+    #[clap(long)]
+    show_funding_qr: bool,
+
+    /// Enter interactive fund withdrawal mode
+    #[clap(long)]
+    withdraw_funds: bool,
+}
 
 
 use tokio::net::TcpStream;
@@ -137,19 +156,59 @@ async fn main() -> Result<()> {
 
     info!("Starting Skyscope Solana MEV Bot");
     info!("Developed by Miss Casey Jay Topojani for Skyscope Sentinel Intelligence");
+
+    let cli_args = CliArgs::parse();
+    let env = Env::new();
+
+    if env.bot_instances.is_empty() {
+        info!("⚠️ No bot instances configured.");
+        info!("   Please set either BOT_INSTANCE_1_KEYPAIR_PATH (for multi-instance mode)");
+        info!("   or PAYER_KEYPAIR_PATH (for single-instance mode) in your .env file.");
+        info!("   Refer to the 'Quick Start' or 'Setting Up Secure Keypairs' section in README.md for detailed instructions.");
+        info!("Exiting.");
+        return Ok(());
+    }
+
+    if cli_args.show_funding_qr {
+        info!("Displaying funding information for configured instances...");
+        for instance_conf in &env.bot_instances {
+            // Pass &env to the now async function
+            if let Err(e) = display_funding_info(&env, instance_conf.id, &instance_conf.payer_keypair_path, instance_conf.budget_usdt).await {
+                log::error!("[Instance {}] Failed to display funding info: {}", instance_conf.id, e);
+            }
+        }
+        info!("Exiting after displaying funding QR codes.");
+        return Ok(());
+    }
+
+    if cli_args.withdraw_funds {
+        // Pass a reference to env
+        if let Err(e) = interactive_withdrawal_flow(&env).await {
+            log::error!("Error during interactive withdrawal: {}", e);
+        }
+        info!("Exiting after withdrawal attempt / cancellation.");
+        return Ok(());
+    }
+
+    // Continue with normal bot operation if --show-funding-qr or --withdraw-funds is not present
     info!("⚠️⚠️ New fresh pools fetched on METEORA and RAYDIUM are excluded because a lot of time there have very low liquidity, potentially can be used on subscribe log strategy");
     info!("⚠️⚠️ Liquidity is fetch to API and can be outdated on Radyium Pool");
 
     let mut set: JoinSet<()> = JoinSet::new();
     
     // // The first token is the base token (here SOL)
-    let tokens_to_arb: Vec<TokenInArb> = inputs_vec.clone().into_iter().flat_map(|input| input.tokens_to_arb).collect();
+    // This is used for global_tokens_infos_arc, ensure it covers all tokens any instance might need.
+    let all_tokens_from_inputs_global: Vec<TokenInArb> = inputs_vec.clone().into_iter().flat_map(|input| input.tokens_to_arb).collect();
 
     info!("Open Socket IO channel...");
-    let env = Env::new();
-    
-    if env.bot_instances.is_empty() {
-        info!("⚠️ No bot instances configured (checked BOT_INSTANCE_1_KEYPAIR_PATH and PAYER_KEYPAIR_PATH). Exiting.");
+    // `env` is already initialized above
+
+    if env.bot_instances.is_empty() { // This check is technically redundant due to the one above, but kept for safety.
+        info!("⚠️ No bot instances configured.");
+        info!("   Please set either BOT_INSTANCE_1_KEYPAIR_PATH (for multi-instance mode)");
+        info!("   or PAYER_KEYPAIR_PATH (for single-instance mode) in your .env file.");
+        info!("   Refer to the 'Quick Start' or 'Setting Up Secure Keypairs' section in README.md for detailed instructions.");
+        info!("Exiting.");
         return Ok(());
     }
     info!("🤖 Found {} bot instance(s) to manage.", env.bot_instances.len());
@@ -312,7 +371,7 @@ async fn main() -> Result<()> {
                 info!("[Instance {}] Skipping best_strategie due to missing global Token Infos.", instance_config.id);
             }
         } // end if best_strategie
-    
+
         if optimism_strategie {
             // Similar to best_strategie, optimism_path is global.
             // If this strategy should be run by each instance with its own funds, it's fine.
@@ -331,11 +390,157 @@ async fn main() -> Result<()> {
 
         info!("---------- Finished operations for Bot Instance ID: {} ----------", instance_config.id);
     } // end loop over bot_instances
-    
+
     while let Some(res) = set.join_next().await {
         info!("JoinSet task completed: {:?}", res);
     }
 
     info!("🏁 Skyscope Solana MEV Bot finished all configured operations.");
+use Skyscope_Solana_MEV_Bot::transactions::transfer_sol::transfer_sol_manager;
+
+// ... (other use statements) ...
+
+async fn interactive_withdrawal_flow(env: &Env) -> Result<()> {
+    info!("Entering interactive fund withdrawal mode...");
+    if env.bot_instances.is_empty() {
+        info!("No bot instances configured. Nothing to withdraw from.");
+        return Ok(());
+    }
+
+    println!("\nAvailable Bot Instances for Withdrawal:");
+    for (idx, instance) in env.bot_instances.iter().enumerate() {
+        println!("{}. Instance ID: {} (Keypair: {})", idx + 1, instance.id, instance.payer_keypair_path);
+    }
+
+    let selected_idx: usize = loop {
+        print!("\nSelect instance number to withdraw from (or 0 to cancel): ");
+        io::stdout().flush()?;
+        let mut selected_idx_str = String::new();
+        io::stdin().read_line(&mut selected_idx_str)?;
+        match selected_idx_str.trim().parse::<usize>() {
+            Ok(0) => {
+                println!("Withdrawal cancelled.");
+                return Ok(());
+            }
+            Ok(num) if num > 0 && num <= env.bot_instances.len() => break num - 1,
+            _ => {
+                println!("Invalid selection. Please enter a number from the list or 0 to cancel.");
+            }
+        };
+    };
+
+    let instance_config = &env.bot_instances[selected_idx];
+    info!("[Instance {}] Selected for withdrawal.", instance_config.id);
+
+    let keypair = solana_sdk::signature::read_keypair_file(&instance_config.payer_keypair_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read keypair for instance {}: {}", instance_config.id, e))?;
+    let pubkey = keypair.pubkey();
+
+    let current_sol_balance = Skyscope_Solana_MEV_Bot::common::budget_manager::get_sol_balance(&env.rpc_url, &pubkey).await?;
+    let sol_price_usdt = Skyscope_Solana_MEV_Bot::common::utils::get_sol_usdt_price().await.unwrap_or(0.0);
+    let balance_usdt = current_sol_balance * sol_price_usdt;
+    println!("\nInstance {} ({}) Balance: {:.9} SOL (~${:.2} USDT)", instance_config.id, pubkey, current_sol_balance, balance_usdt);
+
+    if current_sol_balance < 0.000005 { // Minimum for a transaction
+        println!("Insufficient balance to perform a withdrawal (less than 0.000005 SOL).");
+        return Ok(());
+    }
+
+    let dest_pubkey: Pubkey = loop {
+        print!("\nEnter destination Solana address: ");
+        io::stdout().flush()?;
+        let mut dest_address_str = String::new();
+        io::stdin().read_line(&mut dest_address_str)?;
+        match dest_address_str.trim().parse::<Pubkey>() {
+            Ok(pk) => break pk,
+            Err(_) => {
+                println!("Invalid destination address. Please try again.");
+            }
+        };
+    };
+
+    let amount_to_transfer_sol: f64 = loop {
+        println!("\nSelect amount to transfer:");
+        println!("  1. 25%");
+        println!("  2. 50%");
+        println!("  3. 75%");
+        println!("  4. 100% (leaves minimal SOL for account rent, if possible)");
+        println!("  5. Custom SOL amount");
+        print!("Enter your choice (1-5): ");
+        io::stdout().flush()?;
+        let mut amount_choice_str = String::new();
+        io::stdin().read_line(&mut amount_choice_str)?;
+
+        match amount_choice_str.trim() {
+            "1" => break current_sol_balance * 0.25,
+            "2" => break current_sol_balance * 0.50,
+            "3" => break current_sol_balance * 0.75,
+            "4" => {
+                let rent_buffer = 0.000005; // Rough estimate for lamports for fees, actual rent is complex.
+                break if current_sol_balance > rent_buffer { current_sol_balance - rent_buffer } else { current_sol_balance };
+            },
+            "5" => {
+                print!("\nEnter SOL amount to transfer: ");
+                io::stdout().flush()?;
+                let mut custom_amount_str = String::new();
+                io::stdin().read_line(&mut custom_amount_str)?;
+                match custom_amount_str.trim().parse::<f64>() {
+                    Ok(amt) if amt > 0.0 && amt <= current_sol_balance => break amt,
+                    Ok(amt) if amt > current_sol_balance => {
+                        println!("Custom amount exceeds balance. Max is {:.9} SOL.", current_sol_balance);
+                        // Continue loop
+                    }
+                    _ => {
+                        println!("Invalid custom amount. Please enter a positive number.");
+                        // Continue loop
+                    }
+                }
+            }
+            _ => {
+                println!("Invalid choice. Please enter a number between 1 and 5.");
+                // Continue loop
+            }
+        }
+    };
+
+    if amount_to_transfer_sol <= 0.0 { // Should be caught by loops above, but as a safeguard
+        println!("Transfer amount must be positive. Withdrawal cancelled.");
+        return Ok(());
+    }
+     if amount_to_transfer_sol > current_sol_balance {
+        println!("Transfer amount {:.9} SOL exceeds current balance {:.9} SOL. Withdrawal cancelled.", amount_to_transfer_sol, current_sol_balance);
+        return Ok(());
+    }
+
+    let amount_usdt = amount_to_transfer_sol * sol_price_usdt;
+    println!("\nConfirm Transfer Details:");
+    println!("  From:    Bot Instance {} ({})", instance_config.id, pubkey);
+    println!("  To:      {}", dest_pubkey);
+    println!("  Amount:  {:.9} SOL (~${:.2} USDT)", amount_to_transfer_sol, amount_usdt);
+
+    print!("\nType 'yes' to confirm and proceed with the transfer: ");
+    io::stdout().flush()?;
+    let mut confirmation_str = String::new();
+    io::stdin().read_line(&mut confirmation_str)?;
+
+    if confirmation_str.trim().to_lowercase() == "yes" {
+        info!("[Instance {}] Initiating transfer of {:.9} SOL to {}...", instance_config.id, amount_to_transfer_sol, dest_pubkey);
+
+        match transfer_sol_manager(&env.rpc_url, &keypair, &dest_pubkey, sol_to_lamports(amount_to_transfer_sol)).await {
+            Ok(signature) => {
+                info!("[Instance {}] Transfer successful! Signature: {}", instance_config.id, signature);
+                println!("\n✅ Transfer successful!");
+                println!("   Signature: {}", signature);
+                println!("   Transferred {:.9} SOL from {} to {}.", amount_to_transfer_sol, pubkey, dest_pubkey);
+            }
+            Err(e) => {
+                log::error!("[Instance {}] Transfer failed: {}", instance_config.id, e);
+                println!("\n❌ Transfer failed: {}", e);
+            }
+        }
+    } else {
+        println!("\nWithdrawal cancelled by user.");
+    }
+
     Ok(())
 }
