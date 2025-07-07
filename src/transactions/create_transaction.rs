@@ -20,17 +20,24 @@ use std::io::{BufWriter, Write};
 use crate::{arbitrage::types::SwapPathResult, common::{constants::Env, utils::from_str}, markets::types::DexLabel, transactions::utils::{average, check_tx_status}};
 use super::{meteoradlmm_swap::{construct_meteora_instructions, SwapParametersMeteora}, orca_whirpools_swap::{construct_orca_whirpools_instructions, SwapParametersOrcaWhirpools}, raydium_swap::{construct_raydium_instructions, SwapParametersRaydium}};
 
-pub async fn create_and_send_swap_transaction(simulate_or_send: SendOrSimulate, chain: ChainType, transaction_infos: SwapPathResult) -> Result<()> {
-    info!("🔄 Create swap transaction.... ");
+pub async fn create_and_send_swap_transaction(
+    payer_keypair: &Keypair, // Accept loaded Keypair
+    simulate_or_send: SendOrSimulate,
+    chain: ChainType,
+    transaction_infos: SwapPathResult
+) -> Result<()> {
+    let payer_pubkey = payer_keypair.pubkey();
+    info!("🔄 Create swap transaction for payer {}.... ", payer_pubkey);
     
-    let env = Env::new();
-    let rpc_url = if chain.clone() == ChainType::Mainnet { env.rpc_url_tx.clone() } else { env.devnet_rpc_url };
+    let env = Env::new(); // For RPC URL, etc.
+    let rpc_url = if chain.clone() == ChainType::Mainnet { env.rpc_url_tx.clone() } else { env.devnet_rpc_url.clone() };
     let rpc_client: RpcClient = RpcClient::new(rpc_url);
 
-    let payer: Keypair = read_keypair_file(env.payer_keypair_path.clone()).expect("Wallet keypair file not found");
-    info!("💳 Wallet {:#?}", payer.pubkey());
+    // Payer is now passed as an argument
+    // let payer: Keypair = read_keypair_file(env.payer_keypair_path.clone()).expect("Wallet keypair file not found");
+    info!("💳 Using wallet {:#?}", payer_pubkey);
 
-    info!("🆔 Create/Send Swap instruction....");
+    info!("🆔 Create/Send Swap instruction for {}....", payer_pubkey);
     // Construct Swap instructions
     let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
     let compute_budget_instruction = vec![InstructionDetails{ instruction: compute_budget_ix, details: "Compute Budget Instruction".to_string(), market: None }];
@@ -184,11 +191,11 @@ pub async fn create_and_send_swap_transaction(simulate_or_send: SendOrSimulate, 
 
         };
  
-        let new_payer: Keypair = read_keypair_file(env.payer_keypair_path).expect("Wallet keypair file not found");
+        // Use the passed payer_keypair
         let txn: Transaction = Transaction::new_signed_with_payer(
             &instructions,
-            Some(&new_payer.pubkey()),
-            &vec![&new_payer],
+            Some(&payer_keypair.pubkey()),
+            &vec![payer_keypair], // Pass the reference to the keypair
             rpc_client.get_latest_blockhash_with_commitment(commitment_config).expect("❌ Error in get latest blockhash").0,
         );
         println!("Rpc http address: {}", rpc_client.url());
@@ -200,7 +207,18 @@ pub async fn create_and_send_swap_transaction(simulate_or_send: SendOrSimulate, 
         let non_blocking_rpc_client = solana_client::nonblocking::rpc_client::RpcClient::new(env.rpc_url_tx.clone());
         let arc_rpc_client = Arc::new(non_blocking_rpc_client);
         let connection_cache = ConnectionCache::new_quic("connection_cache_cli_program_quic", 1);
-        let signer: [Arc<dyn Signer>; 1] = [Arc::new(new_payer) as Arc<dyn Signer>];
+
+        // Need to clone payer_keypair to satisfy Arc lifetime if it's an owned Keypair.
+        // However, payer_keypair is a reference. This part needs careful handling of lifetimes
+        // or how the Keypair is passed. For now, assuming a clone or a re-read if necessary,
+        // but ideally, avoid re-reading.
+        // A simple way if Keypair doesn't implement Clone directly for Arc needs:
+        // let temp_payer_for_arc = read_keypair_file(&env.payer_keypair_path).expect("..."); // This is not ideal.
+        // Best would be if payer_keypair itself can be used or cloned into Arc.
+        // Solana's Keypair can be cloned.
+        let signer_keypair_for_arc = Keypair::from_bytes(&payer_keypair.to_bytes()).unwrap();
+        let signer: [Arc<dyn Signer>; 1] = [Arc::new(signer_keypair_for_arc) as Arc<dyn Signer>];
+
 
         let iteration_number = 2;
         let mut iteration_counter = 0;

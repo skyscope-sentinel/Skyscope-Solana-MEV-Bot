@@ -42,10 +42,59 @@ pub struct Env {
     pub profit_threshold_sol: f64,
     pub direct_execution: bool,
     pub log_level: log::LevelFilter,
+    pub bot_instances: Vec<BotInstanceConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BotInstanceConfig {
+    pub id: usize, // 1-indexed for user-friendliness in config
+    pub payer_keypair_path: String,
+    pub budget_usdt: f64,
 }
 
 impl Env {
     pub fn new() -> Self {
+        let mut bot_instances_config = Vec::new();
+        let mut multi_instance_mode = false;
+
+        // Check if multi-instance mode is explicitly configured
+        if !get_env("BOT_INSTANCE_1_KEYPAIR_PATH").is_empty() {
+            multi_instance_mode = true;
+        }
+
+        if multi_instance_mode {
+            for i in 1..=4 { // Max 4 bot instances
+                let keypair_path_env_key = format!("BOT_INSTANCE_{}_KEYPAIR_PATH", i);
+                let budget_usdt_env_key = format!("BOT_INSTANCE_{}_BUDGET_USDT", i);
+
+                let payer_keypair_path = get_env(&keypair_path_env_key);
+
+                // If a keypair path is not provided for an instance, stop adding more.
+                // This allows users to configure 1, 2, 3, or 4 instances.
+                if payer_keypair_path.is_empty() {
+                    break;
+                }
+
+                let budget_usdt = get_env_f64(&budget_usdt_env_key, 3.0); // Default 3 USDT budget if not specified for this instance
+
+                bot_instances_config.push(BotInstanceConfig {
+                    id: i,
+                    payer_keypair_path,
+                    budget_usdt,
+                });
+            }
+        } else {
+            // Single instance mode (legacy or default)
+            let main_payer_keypair_path = get_env("PAYER_KEYPAIR_PATH");
+            if !main_payer_keypair_path.is_empty() {
+                bot_instances_config.push(BotInstanceConfig {
+                    id: 0, // Special ID for single/default instance
+                    payer_keypair_path: main_payer_keypair_path,
+                    budget_usdt: get_env_f64("DEFAULT_BUDGET_USDT", 3.0), // Use a specific env var or default for single instance budget
+                });
+            }
+        }
+
         Env {
             block_engine_url: get_env("BLOCK_ENGINE_URL"),
             rpc_url: get_env("RPC_URL"),

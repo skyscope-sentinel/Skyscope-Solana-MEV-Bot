@@ -15,11 +15,33 @@ use super::{simulate::simulate_path_precision, types::{SwapPath, TokenInArb, Tok
 use log::{debug, error, info};
 use anyhow::Result;
 
+use solana_sdk::signature::read_keypair_file;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::common::{budget_manager, constants::BotInstanceConfig};
+use solana_sdk::native_token::sol_to_lamports;
 
-pub async fn run_arbitrage_strategy(simulation_amount: u64, get_fresh_pools_bool: bool, restrict_sol_usdc: bool, include_1hop: bool, include_2hop: bool, numbers_of_best_paths: usize, dexs: Vec<Dex>, tokens: Vec<TokenInArb>, tokens_infos: HashMap<String, TokenInfos>) -> Result<(String, VecSwapPathSelected)> {
-    info!("👀 Run Arbitrage Strategies...");
+
+pub async fn run_arbitrage_strategy(
+    env_config: &Env, // Pass the global Env config for RPC URLs etc.
+    instance_config: &BotInstanceConfig,
+    simulation_amount_lamports: u64, // Renamed for clarity
+    get_fresh_pools_bool: bool,
+    restrict_sol_usdc: bool,
+    include_1hop: bool,
+    include_2hop: bool,
+    numbers_of_best_paths: usize,
+    dexs: Vec<Dex>,
+    tokens: Vec<TokenInArb>,
+    tokens_infos: HashMap<String, TokenInfos>
+) -> Result<(String, VecSwapPathSelected)> {
+    info!("[Instance {}] 👀 Running Arbitrage Strategy...", instance_config.id);
+
+    // Load keypair for this instance
+    let payer_keypair = read_keypair_file(&instance_config.payer_keypair_path)
+        .map_err(|e| anyhow::anyhow!("[Instance {}] Failed to read keypair from path {}: {}", instance_config.id, instance_config.payer_keypair_path, e))?;
+    let payer_pubkey = payer_keypair.pubkey();
+    info!("[Instance {}] Using payer pubkey: {}", instance_config.id, payer_pubkey);
 
     let markets_arb = get_markets_arb(get_fresh_pools_bool, restrict_sol_usdc, dexs, tokens.clone()).await;
 
@@ -105,52 +127,74 @@ pub async fn run_arbitrage_strategy(simulation_amount: u64, get_fresh_pools_bool
             };
             swap_paths_results.result.push(sp_result.clone());
 
-            let env = Env::new();
-            let profit_threshold_lamports = env.profit_threshold_sol * 1_000_000_000.0;
+            // Note: env_config is the global Env, not the one from Env::new() inside the loop if that was the case before.
+            let profit_threshold_lamports = env_config.profit_threshold_sol * 1_000_000_000.0;
 
             if result_difference > profit_threshold_lamports {
                 let profit_sol = result_difference / 1_000_000_000.0;
-                match crate::common::utils::get_sol_usdt_price().await {
-                    Ok(usdt_price) => {
-                        let profit_usdt = profit_sol * usdt_price;
-                        info!("💸💸💸 Profitable opportunity found: {:.6} SOL (~${:.2} USDT) 💸💸💸", profit_sol, profit_usdt);
-                    }
-                    Err(e) => {
-                        info!("💸💸💸 Profitable opportunity found: {:.6} SOL (failed to fetch USDT price: {}) 💸💸💸", profit_sol, e);
-                    }
-                }
-                info!("💸💸💸💸💸💸💸💸💸 Send transaction execution... 💸💸💸💸💸💸💸💸💸");
+                let current_sol_balance = budget_manager::get_sol_balance(&env_config.rpc_url, &payer_pubkey).await
+                    .map_err(|e| anyhow::anyhow!("[Instance {}] Failed to get SOL balance for budget check: {}", instance_config.id, e))?;
                 
-                let now = Utc::now();
-                let date = format!("{}-{}-{}", now.day(), now.month(), now.year());
+                // The amount to spend for the actual transaction would be sp_result.amount_in (which is u64 lamports)
+                // simulation_amount_lamports is used for discovery, actual spend is determined by the path's input amount.
+                let actual_spend_lamports = sp_result.amount_in;
+                let actual_spend_sol = actual_spend_lamports as f64 / 1_000_000_000.0;
 
-                let path = format!("optimism_transactions/{}-{}-{}.json", date, tokens_path.clone(), counter_sp_result);
-                let _ = insert_swap_path_result_collection("optimism_transactions", sp_result.clone()).await;
-                let _ = write_file_swap_path_result(path.clone(), sp_result.clone());
-                counter_sp_result += 1;
+                let within_budget = budget_manager::is_within_budget(
+                    actual_spend_sol,
+                    instance_config.budget_usdt,
+                    current_sol_balance,
+                    None // Let is_within_budget fetch the price
+                ).await?;
 
-                if env.direct_execution {
-                    info!("🤖 Attempting direct execution of profitable trade...");
-                    let _ = create_and_send_swap_transaction(
-                        SendOrSimulate::Send, // Or Simulate if preferred for a dry run first
-                        ChainType::Mainnet,
-                        sp_result.clone()
-                    ).await;
+                if !within_budget {
+                    info!("[Instance {}] 📉 Trade for {:.6} SOL profit (spending {:.6} SOL) is outside budget of {:.2} USDT or available balance. Skipping.", instance_config.id, profit_sol, actual_spend_sol, instance_config.budget_usdt);
                 } else {
-                    //Send message to Rust execution program
-                    info!("📲 Sending profitable trade to external executor via TCP...");
-                    match TcpStream::connect("127.0.0.1:8080").await {
-                        Ok(mut stream) => {
-                            let message = path.as_bytes();
-                            if let Err(e) = stream.write_all(message).await {
-                                error!("Failed to send message to TCP executor: {}", e);
-                            } else {
-                                info!("🛜  Sent: {} tx to executor", String::from_utf8_lossy(message));
-                            }
+                    match crate::common::utils::get_sol_usdt_price().await {
+                        Ok(usdt_price) => {
+                            let profit_usdt = profit_sol * usdt_price;
+                            info!("[Instance {}] 💸💸💸 Profitable opportunity found: {:.6} SOL (~${:.2} USDT) 💸💸💸", instance_config.id, profit_sol, profit_usdt);
                         }
                         Err(e) => {
-                            error!("Failed to connect to TCP executor at 127.0.0.1:8080: {}", e);
-                            info!("Consider enabling DIRECT_EXECUTION in .env if an external executor is not available.");
+                            info!("[Instance {}] 💸💸💸 Profitable opportunity found: {:.6} SOL (failed to fetch USDT price: {}) 💸💸💸", instance_config.id, profit_sol, e);
+                        }
+                    }
+                    info!("[Instance {}] 💸💸💸💸💸💸💸💸💸 Send transaction execution... 💸💸💸💸💸💸💸💸💸", instance_config.id);
+
+                    let now = Utc::now();
+                    let date = format!("{}-{}-{}", now.day(), now.month(), now.year());
+
+                    // Instance-specific path for optimism transactions
+                    let tx_path_str = format!("optimism_transactions/instance_{}/{}-{}-{}.json", instance_config.id, date, tokens_path.clone(), counter_sp_result);
+                    std::fs::create_dir_all(format!("optimism_transactions/instance_{}", instance_config.id))?; // Ensure directory exists
+
+                    let _ = insert_swap_path_result_collection(&format!("optimism_transactions_instance_{}", instance_config.id), sp_result.clone()).await;
+                    let _ = write_file_swap_path_result(tx_path_str.clone(), sp_result.clone());
+                    counter_sp_result += 1;
+
+                    if env_config.direct_execution {
+                        info!("[Instance {}] 🤖 Attempting direct execution of profitable trade...", instance_config.id);
+                        let _ = create_and_send_swap_transaction(
+                            &payer_keypair, // Pass loaded keypair for this instance
+                            SendOrSimulate::Send,
+                            ChainType::Mainnet,
+                            sp_result.clone()
+                        ).await;
+                    } else {
+                        info!("[Instance {}] 📲 Sending profitable trade to external executor via TCP...", instance_config.id);
+                        match TcpStream::connect("127.0.0.1:8080").await { // TODO: Make TCP server address configurable
+                            Ok(mut stream) => {
+                                let message = tx_path_str.as_bytes();
+                                if let Err(e) = stream.write_all(message).await {
+                                    error!("[Instance {}] Failed to send message to TCP executor: {}", instance_config.id, e);
+                                } else {
+                                    info!("[Instance {}] 🛜  Sent: {} tx to executor", instance_config.id, String::from_utf8_lossy(message));
+                                }
+                            }
+                            Err(e) => {
+                                error!("[Instance {}] Failed to connect to TCP executor at 127.0.0.1:8080: {}", instance_config.id, e);
+                                info!("[Instance {}] Consider enabling DIRECT_EXECUTION in .env if an external executor is not available.", instance_config.id);
+                            }
                         }
                     }
                 }
@@ -331,8 +375,21 @@ pub async fn precision_strategy(socket: Client, path: SwapPath, markets: Vec<Mar
     }
 }   
 
-pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path_str:String, tokens: Vec<TokenInArb>, tokens_infos: HashMap<String, TokenInfos>) -> Result<()>{
-    info!("🔁 Starting sorted_interesting_path_strategy for path file: {}", path_str);
+pub async fn sorted_interesting_path_strategy(
+    env_config: &Env,
+    instance_config: &BotInstanceConfig,
+    simulation_amount_lamports: u64, // Renamed for clarity
+    path_str:String,
+    tokens: Vec<TokenInArb>,
+    tokens_infos: HashMap<String, TokenInfos>
+) -> Result<()>{
+    info!("[Instance {}] 🔁 Starting sorted_interesting_path_strategy for path file: {}", instance_config.id, path_str);
+
+    // Load keypair for this instance
+    let payer_keypair = read_keypair_file(&instance_config.payer_keypair_path)
+        .map_err(|e| anyhow::anyhow!("[Instance {}] Failed to read keypair from path {}: {}", instance_config.id, instance_config.payer_keypair_path, e))?;
+    let payer_pubkey = payer_keypair.pubkey();
+    info!("[Instance {}] Using payer pubkey: {}", instance_config.id, payer_pubkey);
 
     let file_read = OpenOptions::new().read(true).write(true).open(path_str.clone())?;
     let mut paths_vec: VecSwapPathSelected = serde_json::from_reader(&file_read).unwrap();
@@ -366,63 +423,68 @@ pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path_str:S
                     result: result_difference
                 };
                 
-                let env = Env::new();
-                let profit_threshold_lamports = env.profit_threshold_sol * 1_000_000_000.0;
+                let profit_threshold_lamports = env_config.profit_threshold_sol * 1_000_000_000.0;
 
                 if result_difference > profit_threshold_lamports {
                     let profit_sol = result_difference / 1_000_000_000.0;
-                    match crate::common::utils::get_sol_usdt_price().await {
-                        Ok(usdt_price) => {
-                            let profit_usdt = profit_sol * usdt_price;
-                            info!("💸💸💸 Profitable opportunity found by sorted_interesting_path_strategy: {:.6} SOL (~${:.2} USDT) 💸💸💸", profit_sol, profit_usdt);
-                        }
-                        Err(e) => {
-                            info!("💸💸💸 Profitable opportunity found by sorted_interesting_path_strategy: {:.6} SOL (failed to fetch USDT price: {}) 💸💸💸", profit_sol, e);
-                        }
-                    }
-                    info!("💸💸💸💸💸💸💸💸💸 Send transaction execution... 💸💸💸💸💸💸💸💸💸");
-                    // let _ = create_ata_extendlut_transaction(
-                        //     ChainType::Mainnet,
-                        //     SendOrSimulate::Send,
-                    //     sp_result.clone(),
-                    //     from_str("6nGymM5X1djYERKZtoZ3Yz3thChMVF6jVRDzhhcmxuee").unwrap(),
-                    //     tokens_for_tx.clone()
-                    // ).await;
-                    // let _ = create_and_send_swap_transaction(
-                    //     SendOrSimulate::Send,
-                    //     ChainType::Mainnet, 
-                    //     sp_result.clone()
-                    // ).await;
+                    let current_sol_balance = budget_manager::get_sol_balance(&env_config.rpc_url, &payer_pubkey).await
+                        .map_err(|e| anyhow::anyhow!("[Instance {}] Failed to get SOL balance for budget check (sorted_interesting_path): {}", instance_config.id, e))?;
                     
-                    let now = Utc::now();
-                    let date = format!("{}-{}-{}", now.day(), now.month(), now.year());
+                    let actual_spend_lamports = sp_result.amount_in;
+                    let actual_spend_sol = actual_spend_lamports as f64 / 1_000_000_000.0;
 
-                    let path = format!("optimism_transactions/{}-{}-{}.json", date, tokens_path, counter_sp_result);
-                    let _ = write_file_swap_path_result(path.clone(), sp_result.clone());
-                    counter_sp_result += 1;
-                    
-                    if env.direct_execution {
-                        info!("🤖 Attempting direct execution of profitable trade (sorted_interesting_path_strategy)...");
-                        let _ = create_and_send_swap_transaction(
-                            SendOrSimulate::Send,
-                            ChainType::Mainnet,
-                            sp_result.clone()
-                        ).await;
+                    let within_budget = budget_manager::is_within_budget(
+                        actual_spend_sol,
+                        instance_config.budget_usdt,
+                        current_sol_balance,
+                        None
+                    ).await?;
+
+                    if !within_budget {
+                        info!("[Instance {}] 📉 Trade (sorted_interesting_path) for {:.6} SOL profit (spending {:.6} SOL) is outside budget of {:.2} USDT or available balance. Skipping.", instance_config.id, profit_sol, actual_spend_sol, instance_config.budget_usdt);
                     } else {
-                        //Send message to Rust execution program
-                        info!("📲 Sending profitable trade to external executor via TCP (sorted_interesting_path_strategy)...");
-                        match TcpStream::connect("127.0.0.1:8080").await {
-                            Ok(mut stream) => {
-                                let message = path.as_bytes();
-                                if let Err(e) = stream.write_all(message).await {
-                                    error!("Failed to send message to TCP executor: {}",e);
-                                } else {
-                                    info!("🛜  Sent: {} tx to executor", String::from_utf8_lossy(message));
-                                }
+                        match crate::common::utils::get_sol_usdt_price().await {
+                            Ok(usdt_price) => {
+                                let profit_usdt = profit_sol * usdt_price;
+                                info!("[Instance {}] 💸💸💸 Profitable opportunity (sorted_interesting_path): {:.6} SOL (~${:.2} USDT) 💸💸💸", instance_config.id, profit_sol, profit_usdt);
                             }
                             Err(e) => {
-                                error!("Failed to connect to TCP executor at 127.0.0.1:8080: {}", e);
-                                info!("Consider enabling DIRECT_EXECUTION in .env if an external executor is not available.");
+                                info!("[Instance {}] 💸💸💸 Profitable opportunity (sorted_interesting_path): {:.6} SOL (failed to fetch USDT price: {}) 💸💸💸", instance_config.id, profit_sol, e);
+                            }
+                        }
+                        info!("[Instance {}] 💸💸💸💸💸💸💸💸💸 Send transaction execution (sorted_interesting_path)... 💸💸💸💸💸💸💸💸💸", instance_config.id);
+
+                        let now = Utc::now();
+                        let date = format!("{}-{}-{}", now.day(), now.month(), now.year());
+
+                        let tx_path_str = format!("optimism_transactions/instance_{}/sorted-{}-{}-{}.json", instance_config.id, date, tokens_path, counter_sp_result);
+                        std::fs::create_dir_all(format!("optimism_transactions/instance_{}", instance_config.id))?;
+                        let _ = write_file_swap_path_result(tx_path_str.clone(), sp_result.clone());
+                        counter_sp_result += 1;
+
+                        if env_config.direct_execution {
+                            info!("[Instance {}] 🤖 Attempting direct execution (sorted_interesting_path)...", instance_config.id);
+                            let _ = create_and_send_swap_transaction(
+                                &payer_keypair,
+                                SendOrSimulate::Send,
+                                ChainType::Mainnet,
+                                sp_result.clone()
+                            ).await;
+                        } else {
+                            info!("[Instance {}] 📲 Sending profitable trade to external executor via TCP (sorted_interesting_path)...", instance_config.id);
+                            match TcpStream::connect("127.0.0.1:8080").await { // TODO: Make TCP server address configurable
+                                Ok(mut stream) => {
+                                    let message = tx_path_str.as_bytes();
+                                    if let Err(e) = stream.write_all(message).await {
+                                        error!("[Instance {}] Failed to send message to TCP executor (sorted_interesting_path): {}",instance_config.id, e);
+                                    } else {
+                                        info!("[Instance {}] 🛜  Sent: {} tx to executor (sorted_interesting_path)",instance_config.id, String::from_utf8_lossy(message));
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("[Instance {}] Failed to connect to TCP executor at 127.0.0.1:8080 (sorted_interesting_path): {}", instance_config.id, e);
+                                    info!("[Instance {}] Consider enabling DIRECT_EXECUTION in .env if an external executor is not available.", instance_config.id);
+                                }
                             }
                         }
                     }
@@ -435,27 +497,49 @@ pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path_str:S
 
 }
 
-pub async fn optimism_tx_strategy(path_str:String) -> Result<()>{
-    info!("🚀 Starting optimism_tx_strategy for transaction file: {}", path_str);
+pub async fn optimism_tx_strategy(
+    env_config: &Env,
+    instance_config: &BotInstanceConfig,
+    path_str:String
+) -> Result<()>{
+    info!("[Instance {}] 🚀 Starting optimism_tx_strategy for transaction file: {}", instance_config.id, path_str);
+
+    // Load keypair for this instance
+    let payer_keypair = read_keypair_file(&instance_config.payer_keypair_path)
+        .map_err(|e| anyhow::anyhow!("[Instance {}] Failed to read keypair from path {}: {}", instance_config.id, instance_config.payer_keypair_path, e))?;
+    let payer_pubkey = payer_keypair.pubkey();
+    info!("[Instance {}] Using payer pubkey: {}", instance_config.id, payer_pubkey);
 
     let file_read = OpenOptions::new().read(true).write(true).open(path_str.clone())?;
     let spr: SwapPathResult = serde_json::from_reader(&file_read).unwrap();
-    // let mut counter_sp_result = 0; // This variable is not used in this function
 
-    info!("💸 Executing pre-defined optimistic transaction from {}", path_str);
-    // let _ = create_ata_extendlut_transaction(
-    //     ChainType::Mainnet,
-    //     SendOrSimulate::Send,
-    //     sp_result.clone(),
-    //     from_str("6nGymM5X1djYERKZtoZ3Yz3thChMVF6jVRDzhhcmxuee").unwrap(),
-    //     tokens_for_tx.clone()
-    // ).await;
+    // Budget Check for optimism_tx_strategy
+    let actual_spend_lamports = spr.amount_in;
+    let actual_spend_sol = actual_spend_lamports as f64 / 1_000_000_000.0;
+
+    let current_sol_balance = budget_manager::get_sol_balance(&env_config.rpc_url, &payer_pubkey).await
+        .map_err(|e| anyhow::anyhow!("[Instance {}] Failed to get SOL balance for budget check (optimism_tx): {}", instance_config.id, e))?;
+
+    let within_budget = budget_manager::is_within_budget(
+        actual_spend_sol,
+        instance_config.budget_usdt,
+        current_sol_balance,
+        None
+    ).await?;
+
+    if !within_budget {
+        info!("[Instance {}] 📉 Optimistic transaction (spending {:.6} SOL from file {}) is outside budget of {:.2} USDT or available balance. Skipping.", instance_config.id, actual_spend_sol, path_str, instance_config.budget_usdt);
+        return Ok(());
+    }
+
+    info!("[Instance {}] 💸 Executing pre-defined optimistic transaction from {}", instance_config.id, path_str);
+
     let _ = create_and_send_swap_transaction(
-        SendOrSimulate::Send,
+        &payer_keypair,
+        SendOrSimulate::Send, // Optimism strategy implies Send
         ChainType::Mainnet, 
         spr.clone()
     ).await;
 
     Ok(())
-
 }
