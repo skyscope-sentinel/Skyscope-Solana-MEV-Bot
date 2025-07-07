@@ -4,4 +4,5 @@ pub mod utils;
 pub mod maths;
 pub mod debug;
 pub mod types;
+pub mod budget_manager;
 pub mod database;

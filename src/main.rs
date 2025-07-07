@@ -9,7 +9,9 @@ use log::info;
 use solana_sdk::pubkey::Pubkey;
 use tokio::task::JoinSet;
 use solana_client::rpc_client::RpcClient;
+use std::sync::Arc;
 use Skyscope_Solana_MEV_Bot::arbitrage::strategies::{optimism_tx_strategy, run_arbitrage_strategy, sorted_interesting_path_strategy};
+use Skyscope_Solana_MEV_Bot::common::constants::BotInstanceConfig;
 use Skyscope_Solana_MEV_Bot::common::database::insert_vec_swap_path_selected_collection;
 use Skyscope_Solana_MEV_Bot::common::types::InputVec;
 use Skyscope_Solana_MEV_Bot::markets::pools::load_all_pools;
@@ -17,6 +19,7 @@ use Skyscope_Solana_MEV_Bot::transactions::create_transaction::{create_ata_exten
 use Skyscope_Solana_MEV_Bot::{common::constants::Env, transactions::create_transaction::create_and_send_swap_transaction};
 use Skyscope_Solana_MEV_Bot::common::utils::{from_str, get_tokens_infos, setup_logger};
 use Skyscope_Solana_MEV_Bot::arbitrage::types::{SwapPathResult, SwapPathSelected, SwapRouteSimulation, TokenInArb, TokenInfos, VecSwapPathSelected};
+use Skyscope_Solana_MEV_Bot::markets::types::Dex as DexType; // Renamed to avoid conflict
 use rust_socketio::{Payload, asynchronous::{Client, ClientBuilder},};
 
 
@@ -145,115 +148,189 @@ async fn main() -> Result<()> {
     info!("Open Socket IO channel...");
     let env = Env::new();
     
+    if env.bot_instances.is_empty() {
+        info!("⚠️ No bot instances configured (checked BOT_INSTANCE_1_KEYPAIR_PATH and PAYER_KEYPAIR_PATH). Exiting.");
+        return Ok(());
+    }
+    info!("🤖 Found {} bot instance(s) to manage.", env.bot_instances.len());
+
+    // Global data fetching (once)
+    let dexs_arc = if massive_strategie || best_strategie { // best_strategie might also need dexs
+        info!("🏊 Launching global pool fetching...");
+        let dexs = load_all_pools(fetch_new_pools).await;
+        info!("🏊 {} Global DEXs data loaded.", dexs.len());
+        Some(std::sync::Arc::new(dexs))
+    } else {
+        None
+    };
+
+    let all_tokens_from_inputs: Vec<TokenInArb> = inputs_vec.clone().into_iter().flat_map(|input| input.tokens_to_arb).collect();
+    let global_tokens_infos_arc = if massive_strategie || best_strategie { // best_strategie needs token_infos
+        info!("🪙 Fetching global token infos for all specified input tokens...");
+        let infos = get_tokens_infos(all_tokens_from_inputs.clone()).await;
+        info!("🪙 {} Global token infos loaded.", infos.len());
+        Some(std::sync::Arc::new(infos))
+    } else {
+        None
+    };
+
+    // Socket.IO client setup (once)
+    // Note: If strategies need to send instance-specific data over socket.io, the client might need to be cloned
+    // or managed differently. For now, assuming it's for general non-instance-specific comms if used by strategies.
     let callback = |payload: Payload, socket: Client| {
         async move {
             match payload {
-                Payload::String(data) => println!("Received: {}", data),
-                Payload::Binary(bin_data) => println!("Received bytes: {:#?}", bin_data),
-                Payload::Text(data) => println!("Received Text: {:?}", data),
+                Payload::String(data) => println!("Received: {}", data), // Consider using log::info!
+                Payload::Binary(bin_data) => println!("Received bytes: {:#?}", bin_data), // Consider using log::info!
+                Payload::Text(data) => println!("Received Text: {:?}", data), // Consider using log::info!
             }
         }
         .boxed()
     };
     
-    let mut socket = ClientBuilder::new("http://localhost:3000")
+    let mut socket = ClientBuilder::new("http://localhost:3000") // TODO: Make configurable
         .namespace("/")
         .on("connection", callback)
         .on("error", |err, _| {
-            async move { eprintln!("Error: {:#?}", err) }.boxed()
+            async move { eprintln!("SocketIO Error: {:#?}", err) }.boxed() // Consider log::error!
         })
-        .on("orca_quote", callback)
-        .on("orca_quote_res", callback)
+        .on("orca_quote", callback) // Example event
+        .on("orca_quote_res", callback) // Example event
         .connect()
         .await
-        .expect("Connection failed");
+        .expect("SocketIO connection failed"); // Consider graceful error handling
 
 
-    if massive_strategie {
-        info!("🏊 Launch pools fetching infos...");
-        let dexs = load_all_pools(fetch_new_pools).await;
-        info!("🏊 {} Dexs are loaded", dexs.len());
-        
-        
-        info!("🪙🪙 Tokens Infos: {:?}", tokens_to_arb);
-        info!("📈 Launch arbitrage process...");
-        let mut vec_best_paths:Vec<String> = Vec::new();
-        for input_iter in inputs_vec.clone() {
-            let tokens_infos: HashMap<String, TokenInfos> = get_tokens_infos(input_iter.tokens_to_arb.clone()).await;
+    for instance_config in &env.bot_instances {
+        info!("---------- Starting operations for Bot Instance ID: {} ----------", instance_config.id);
+        info!("   Keypair Path: {}", instance_config.payer_keypair_path);
+        info!("   Budget: {:.2} USDT", instance_config.budget_usdt);
 
-            info!("Running arbitrage strategy for tokens: {:?}", input_iter.tokens_to_arb.iter().map(|t| &t.symbol).collect::<Vec<_>>());
-            let result = run_arbitrage_strategy(simulation_amount, input_iter.get_fresh_pools_bool, restrict_sol_usdc, input_iter.include_1hop, input_iter.include_2hop, input_iter.numbers_of_best_paths, dexs.clone(), input_iter.tokens_to_arb.clone(), tokens_infos.clone()).await;
-            match result {
-                Ok((path_for_best_strategie, swap_path_selected)) => {
-                    vec_best_paths.push(path_for_best_strategie);
-                    if let Some(profit) = swap_path_selected.profit {
-                        let profit_sol = profit as f64 / 1_000_000_000.0; // Assuming profit is in lamports
-                        match Skyscope_Solana_MEV_Bot::common::utils::get_sol_usdt_price().await {
-                            Ok(usdt_price) => {
-                                let profit_usdt = profit_sol * usdt_price;
-                                info!("📈 Strategy found potential profit: {:.6} SOL (~${:.2} USDT)", profit_sol, profit_usdt);
+        // It's important that strategies called below are adapted to use instance_config.payer_keypair_path for transactions
+        // and respect instance_config.budget_usdt. This will be part of "Strategy Adaptation" step.
+
+        if massive_strategie {
+            if let Some(ref dexs_arc_inner) = dexs_arc {
+                if let Some(ref global_tokens_infos_inner) = global_tokens_infos_arc {
+                    info!("📈 [Instance {}] Launching arbitrage process (massive_strategie)...", instance_config.id);
+                    let mut instance_specific_best_paths: Vec<String> = Vec::new(); // Paths generated by this instance
+
+                    for input_iter in inputs_vec.clone() {
+                        let current_tokens_infos: HashMap<String, TokenInfos> = input_iter.tokens_to_arb.iter()
+                            .filter_map(|token_in_arb| {
+                                global_tokens_infos_inner.get(&token_in_arb.address).map(|info| (token_in_arb.address.clone(), info.clone()))
+                            })
+                            .collect();
+
+                        if current_tokens_infos.len() != input_iter.tokens_to_arb.len() {
+                            log::warn!("[Instance {}] Not all token infos found for an input_vec using symbols {:?}, skipping.", instance_config.id, input_iter.tokens_to_arb.iter().map(|t|&t.symbol).collect::<Vec<_>>());
+                            continue;
+                        }
+
+                        info!("[Instance {}] Running massive_strategie for tokens: {:?}", instance_config.id, input_iter.tokens_to_arb.iter().map(|t| &t.symbol).collect::<Vec<_>>());
+
+                        // TODO: Adapt run_arbitrage_strategy to take instance_config
+                        let result = run_arbitrage_strategy(
+                            simulation_amount,
+                            input_iter.get_fresh_pools_bool,
+                            restrict_sol_usdc,
+                            input_iter.include_1hop,
+                            input_iter.include_2hop,
+                            input_iter.numbers_of_best_paths,
+                            dexs_arc_inner.to_vec(),
+                            input_iter.tokens_to_arb.clone(),
+                            current_tokens_infos.clone()
+                            // instance_config.clone() // This will be added
+                        ).await;
+
+                        match result {
+                            Ok((path_for_best_strategie_local, swap_path_selected)) => {
+                                // Store path relative to this instance if needed, or use a naming convention
+                                // For now, this path is local to this input_iter processing.
+                                instance_specific_best_paths.push(path_for_best_strategie_local.clone());
+                                if !path_for_best_strategie_local.is_empty() { // Assuming empty means no good path found / saved
+                                     path_best_strategie = path_for_best_strategie_local; // This will be overwritten by last successful one. Needs better handling.
+                                }
+
+                                if let Some(profit) = swap_path_selected.profit {
+                                    let profit_sol = profit as f64 / 1_000_000_000.0;
+                                    match Skyscope_Solana_MEV_Bot::common::utils::get_sol_usdt_price().await {
+                                        Ok(usdt_price) => {
+                                            let profit_usdt = profit_sol * usdt_price;
+                                            info!("📈 [Instance {}] Massive strategy found potential profit: {:.6} SOL (~${:.2} USDT)", instance_config.id, profit_sol, profit_usdt);
+                                        }
+                                        Err(e) => {
+                                            info!("📈 [Instance {}] Massive strategy found potential profit: {:.6} SOL (failed to fetch USDT price: {})", instance_config.id, profit_sol, e);
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
-                                info!("📈 Strategy found potential profit: {:.6} SOL (failed to fetch USDT price: {})", profit_sol, e);
+                                log::error!("[Instance {}] Error running massive_strategie for input {:?}: {:?}", instance_config.id, input_iter.tokens_to_arb.iter().map(|t|&t.symbol).collect::<Vec<_>>(), e);
                             }
                         }
+                    } // end loop input_iter
+
+                    // The ultra_strat logic needs significant rework if it's to be instance-aware or aggregate instance results.
+                    // For now, it's commented out or will use the last `path_best_strategie`.
+                    /*
+                    if inputs_vec.clone().len() > 1 && !instance_specific_best_paths.is_empty() {
+                        // This logic needs to be instance-specific for file names and DB entries
+                        info!("[Instance {}] Processing ultra strategies...", instance_config.id);
+                        // ... (Adapted ultra_strat logic here using instance_specific_best_paths) ...
+                        // path_best_strategie = instance_specific_ultra_strat_path; // update for this instance
                     }
-                }
-                Err(e) => {
-                    log::error!("Error running arbitrage strategy: {:?}", e);
-                }
-            }
-        }
-        if inputs_vec.clone().len() > 1 {
-            let mut vec_to_ultra_strat: Vec<SwapPathSelected> = Vec::new();
-            let mut ultra_strat_name: String = format!("");
-            for (index, iter_path) in vec_best_paths.iter().enumerate() {
-                let name_raw: Vec<&str> = iter_path.split('/').collect();
-                let name: Vec<&str> = name_raw[1].split('.').collect();
-                if index == 0 {
-                    ultra_strat_name = format!("{}-{}", index, name[0]);
+                    */
                 } else {
-                    ultra_strat_name = format!("{}-{}-{}", ultra_strat_name, index, name[0]);
+                    info!("[Instance {}] Skipping massive_strategie due to missing global data (DEXs or Token Infos).", instance_config.id);
                 }
-
-                let file_read = OpenOptions::new().read(true).write(true).open(iter_path)?;
-                let mut paths_vec: VecSwapPathSelected = serde_json::from_reader(&file_read).unwrap();
-                for sp_iter in paths_vec.value {
-                    vec_to_ultra_strat.push(sp_iter);
-                }
+            } else {
+                 info!("[Instance {}] Skipping massive_strategie as it's not enabled.", instance_config.id);
             }
-            let mut path = format!("best_paths_selected/ultra_strategies/{}.json", ultra_strat_name);
-            File::create(path.clone());
-        
-            let file = OpenOptions::new().read(true).write(true).open(path.clone())?;
-            let mut writer = BufWriter::new(&file);
-        
-            let mut content = VecSwapPathSelected{value: vec_to_ultra_strat.clone()};
-            writer.write_all(serde_json::to_string(&content)?.as_bytes())?;
-            writer.flush()?;
-            info!("Data written to '{}' successfully.", path);
-
-            insert_vec_swap_path_selected_collection("ultra_strategies", content).await;
-
-            path_best_strategie = path;
-        }
+        } // end if massive_strategie
 
         if best_strategie {
-            let tokens_infos: HashMap<String, TokenInfos> = get_tokens_infos(tokens_to_arb.clone()).await;
-
-            let _ = sorted_interesting_path_strategy(simulation_amount, path_best_strategie.clone(), tokens_to_arb.clone(), tokens_infos.clone()).await;
-        }
-    }
+            if let Some(ref global_tokens_infos_inner) = global_tokens_infos_arc {
+                // `path_best_strategie` is problematic here as it's globally scoped and overwritten.
+                // This strategy should ideally operate on paths generated by *this* instance,
+                // or a well-defined shared path if that's the design.
+                // Using the global `path_best_strategie` for now, acknowledging this limitation.
+                if !path_best_strategie.is_empty() {
+                    info!("[Instance {}] Running best_strategie using path: {}...", instance_config.id, path_best_strategie);
+                    // TODO: Adapt sorted_interesting_path_strategy for instance_config
+                    let _ = sorted_interesting_path_strategy(
+                        simulation_amount,
+                        path_best_strategie.clone(),
+                        all_tokens_from_inputs.clone(), // This should ideally be instance specific tokens or based on the path
+                        global_tokens_infos_inner.as_ref().clone()
+                        // instance_config.clone() // This will be added
+                    ).await;
+                } else {
+                    info!("[Instance {}] Skipping best_strategie as no best_path_file was determined.", instance_config.id);
+                }
+            } else {
+                info!("[Instance {}] Skipping best_strategie due to missing global Token Infos.", instance_config.id);
+            }
+        } // end if best_strategie
     
-    if best_strategie {
-        let tokens_infos: HashMap<String, TokenInfos> = get_tokens_infos(tokens_to_arb.clone()).await;
+        if optimism_strategie {
+            // Similar to best_strategie, optimism_path is global.
+            // If this strategy should be run by each instance with its own funds, it's fine.
+            // If the optimism_path is specific to one instance's state, this needs adjustment.
+            if !optimism_path.is_empty(){
+                info!("[Instance {}] Running optimism_tx_strategy with path: {}...", instance_config.id, optimism_path);
+                // TODO: Adapt optimism_tx_strategy for instance_config
+                let _ = optimism_tx_strategy(
+                    optimism_path.clone()
+                    // instance_config.clone() // This will be added
+                ).await;
+            } else {
+                info!("[Instance {}] Skipping optimism_strategie as no optimism_path was provided.", instance_config.id);
+            }
+        } // end if optimism_strategie
 
-        let _ = sorted_interesting_path_strategy(simulation_amount, path_best_strategie.clone(), tokens_to_arb.clone(), tokens_infos.clone()).await;
-    }
-    
-    if optimism_strategie {
-        let _ = optimism_tx_strategy(optimism_path);
-    }
+        info!("---------- Finished operations for Bot Instance ID: {} ----------", instance_config.id);
+    } // end loop over bot_instances
     
     while let Some(res) = set.join_next().await {
         info!("JoinSet task completed: {:?}", res);
