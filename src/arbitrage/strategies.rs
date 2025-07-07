@@ -9,7 +9,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::io::{BufWriter, Write};
 use crate::{arbitrage::{
     calc_arb::{calculate_arb, get_markets_arb}, simulate::simulate_path, streams::get_fresh_accounts_states, types::{SwapPathResult, SwapPathSelected, SwapRouteSimulation, VecSwapPathResult, VecSwapPathSelected}
-}, common::{database::{insert_vec_swap_path_selected_collection, insert_swap_path_result_collection}, utils::{from_str, write_file_swap_path_result}}, transactions::create_transaction::{self, create_and_send_swap_transaction, create_ata_extendlut_transaction, ChainType, SendOrSimulate}};
+}, common::{constants::Env, database::{insert_vec_swap_path_selected_collection, insert_swap_path_result_collection}, utils::{from_str, write_file_swap_path_result}}, transactions::create_transaction::{self, create_and_send_swap_transaction, create_ata_extendlut_transaction, ChainType, SendOrSimulate}};
 use crate::markets::types::{Dex,Market};
 use super::{simulate::simulate_path_precision, types::{SwapPath, TokenInArb, TokenInfos}};
 use log::{debug, error, info};
@@ -105,27 +105,55 @@ pub async fn run_arbitrage_strategy(simulation_amount: u64, get_fresh_pools_bool
             };
             swap_paths_results.result.push(sp_result.clone());
 
-            if result_difference > 20000000.0 {
-                println!("💸💸💸💸💸💸💸💸💸 Begin Execute the tx 💸💸💸💸💸💸💸💸💸");
+            let env = Env::new();
+            let profit_threshold_lamports = env.profit_threshold_sol * 1_000_000_000.0;
+
+            if result_difference > profit_threshold_lamports {
+                let profit_sol = result_difference / 1_000_000_000.0;
+                match crate::common::utils::get_sol_usdt_price().await {
+                    Ok(usdt_price) => {
+                        let profit_usdt = profit_sol * usdt_price;
+                        info!("💸💸💸 Profitable opportunity found: {:.6} SOL (~${:.2} USDT) 💸💸💸", profit_sol, profit_usdt);
+                    }
+                    Err(e) => {
+                        info!("💸💸💸 Profitable opportunity found: {:.6} SOL (failed to fetch USDT price: {}) 💸💸💸", profit_sol, e);
+                    }
+                }
                 info!("💸💸💸💸💸💸💸💸💸 Send transaction execution... 💸💸💸💸💸💸💸💸💸");
                 
                 let now = Utc::now();
                 let date = format!("{}-{}-{}", now.day(), now.month(), now.year());
 
                 let path = format!("optimism_transactions/{}-{}-{}.json", date, tokens_path.clone(), counter_sp_result);
-                let _ = insert_swap_path_result_collection("optimism_transactions", sp_result.clone()).await;  
-                let _ = write_file_swap_path_result(path.clone(), sp_result);
+                let _ = insert_swap_path_result_collection("optimism_transactions", sp_result.clone()).await;
+                let _ = write_file_swap_path_result(path.clone(), sp_result.clone());
                 counter_sp_result += 1;
-                
-                //Send message to Rust execution program
-                let mut stream = TcpStream::connect("127.0.0.1:8080").await?;
 
-                let message = path.as_bytes();
-                stream.write_all(message).await?;
-                info!("🛜  Sent: {} tx to executor", String::from_utf8_lossy(message));
-                // let mut buffer = [0; 512];
-                // let n = stream.read(&mut buffer).await?;
-                // info!("Received: {}", String::from_utf8_lossy(&buffer[0..n]));
+                if env.direct_execution {
+                    info!("🤖 Attempting direct execution of profitable trade...");
+                    let _ = create_and_send_swap_transaction(
+                        SendOrSimulate::Send, // Or Simulate if preferred for a dry run first
+                        ChainType::Mainnet,
+                        sp_result.clone()
+                    ).await;
+                } else {
+                    //Send message to Rust execution program
+                    info!("📲 Sending profitable trade to external executor via TCP...");
+                    match TcpStream::connect("127.0.0.1:8080").await {
+                        Ok(mut stream) => {
+                            let message = path.as_bytes();
+                            if let Err(e) = stream.write_all(message).await {
+                                error!("Failed to send message to TCP executor: {}", e);
+                            } else {
+                                info!("🛜  Sent: {} tx to executor", String::from_utf8_lossy(message));
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to TCP executor at 127.0.0.1:8080: {}", e);
+                            info!("Consider enabling DIRECT_EXECUTION in .env if an external executor is not available.");
+                        }
+                    }
+                }
             }
 
             // Reset errors if one path is good to only skip paths on 3 consecutives errors
@@ -280,12 +308,21 @@ pub async fn precision_strategy(socket: Client, path: SwapPath, markets: Vec<Mar
             
             if result_difference > result_amt {
                 result_amt = result_difference;
-                println!("result_amt: {}", result_amt);
+                let profit_sol = result_amt / 1_000_000_000.0; // Assuming result_amt is in lamports
+                match crate::common::utils::get_sol_usdt_price().await {
+                    Ok(usdt_price) => {
+                        let profit_usdt = profit_sol * usdt_price;
+                        info!("Precision strategy found potential profit: {:.6} SOL (~${:.2} USDT) with amount_in: {}", profit_sol, profit_usdt, amount_in);
+                    }
+                    Err(e) => {
+                        info!("Precision strategy found potential profit: {:.6} SOL (failed to fetch USDT price: {}) with amount_in: {}", profit_sol, e, amount_in);
+                    }
+                }
                 sp_to_tx = Some(sp_result.clone());
             }
         }
     }
-    if result_amt > 0.1 && sp_to_tx.is_some() {
+    if result_amt > 0.1 && sp_to_tx.is_some() { // Changed from 0.1 to a more realistic lamport value if needed, assuming 0.1 SOL for now
         // let _ = create_and_send_swap_transaction(
         //     create_transaction::SendOrSimulate::Simulate, 
         //     create_transaction::ChainType::Mainnet, 
@@ -294,9 +331,10 @@ pub async fn precision_strategy(socket: Client, path: SwapPath, markets: Vec<Mar
     }
 }   
 
-pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path:String, tokens: Vec<TokenInArb>, tokens_infos: HashMap<String, TokenInfos>) -> Result<()>{
+pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path_str:String, tokens: Vec<TokenInArb>, tokens_infos: HashMap<String, TokenInfos>) -> Result<()>{
+    info!("🔁 Starting sorted_interesting_path_strategy for path file: {}", path_str);
 
-    let file_read = OpenOptions::new().read(true).write(true).open(path)?;
+    let file_read = OpenOptions::new().read(true).write(true).open(path_str.clone())?;
     let mut paths_vec: VecSwapPathSelected = serde_json::from_reader(&file_read).unwrap();
     let mut counter_sp_result = 0;
 
@@ -328,8 +366,20 @@ pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path:Strin
                     result: result_difference
                 };
                 
-                if result_difference > 20000000.0 {
-                    println!("💸💸💸💸💸💸💸💸💸 Begin Execute the tx 💸💸💸💸💸💸💸💸💸");
+                let env = Env::new();
+                let profit_threshold_lamports = env.profit_threshold_sol * 1_000_000_000.0;
+
+                if result_difference > profit_threshold_lamports {
+                    let profit_sol = result_difference / 1_000_000_000.0;
+                    match crate::common::utils::get_sol_usdt_price().await {
+                        Ok(usdt_price) => {
+                            let profit_usdt = profit_sol * usdt_price;
+                            info!("💸💸💸 Profitable opportunity found by sorted_interesting_path_strategy: {:.6} SOL (~${:.2} USDT) 💸💸💸", profit_sol, profit_usdt);
+                        }
+                        Err(e) => {
+                            info!("💸💸💸 Profitable opportunity found by sorted_interesting_path_strategy: {:.6} SOL (failed to fetch USDT price: {}) 💸💸💸", profit_sol, e);
+                        }
+                    }
                     info!("💸💸💸💸💸💸💸💸💸 Send transaction execution... 💸💸💸💸💸💸💸💸💸");
                     // let _ = create_ata_extendlut_transaction(
                         //     ChainType::Mainnet,
@@ -348,34 +398,51 @@ pub async fn sorted_interesting_path_strategy(simulation_amount: u64, path:Strin
                     let date = format!("{}-{}-{}", now.day(), now.month(), now.year());
 
                     let path = format!("optimism_transactions/{}-{}-{}.json", date, tokens_path, counter_sp_result);
-                    let _ = write_file_swap_path_result(path.clone(), sp_result);
+                    let _ = write_file_swap_path_result(path.clone(), sp_result.clone());
                     counter_sp_result += 1;
                     
-                    //Send message to Rust execution program
-                    let mut stream = TcpStream::connect("127.0.0.1:8080").await?;
-    
-                    let message = path.as_bytes();
-                    stream.write_all(message).await?;
-                    info!("🛜  Sent: {} tx to executor", String::from_utf8_lossy(message));
-                    // let mut buffer = [0; 512];
-                    // let n = stream.read(&mut buffer).await?;
-                    // info!("Received: {}", String::from_utf8_lossy(&buffer[0..n]));
+                    if env.direct_execution {
+                        info!("🤖 Attempting direct execution of profitable trade (sorted_interesting_path_strategy)...");
+                        let _ = create_and_send_swap_transaction(
+                            SendOrSimulate::Send,
+                            ChainType::Mainnet,
+                            sp_result.clone()
+                        ).await;
+                    } else {
+                        //Send message to Rust execution program
+                        info!("📲 Sending profitable trade to external executor via TCP (sorted_interesting_path_strategy)...");
+                        match TcpStream::connect("127.0.0.1:8080").await {
+                            Ok(mut stream) => {
+                                let message = path.as_bytes();
+                                if let Err(e) = stream.write_all(message).await {
+                                    error!("Failed to send message to TCP executor: {}",e);
+                                } else {
+                                    info!("🛜  Sent: {} tx to executor", String::from_utf8_lossy(message));
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to connect to TCP executor at 127.0.0.1:8080: {}", e);
+                                info!("Consider enabling DIRECT_EXECUTION in .env if an external executor is not available.");
+                            }
+                        }
+                    }
                 }
             }
-            sleep(time::Duration::from_millis(200))
+            sleep(time::Duration::from_millis(200)) // Consider making this sleep duration configurable
         }
     }
     // Ok(())
 
 }
 
-pub async fn optimism_tx_strategy(path:String) -> Result<()>{
+pub async fn optimism_tx_strategy(path_str:String) -> Result<()>{
+    info!("🚀 Starting optimism_tx_strategy for transaction file: {}", path_str);
 
-    let file_read = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut spr: SwapPathResult = serde_json::from_reader(&file_read).unwrap();
-    let mut counter_sp_result = 0;
+    let file_read = OpenOptions::new().read(true).write(true).open(path_str.clone())?;
+    let spr: SwapPathResult = serde_json::from_reader(&file_read).unwrap();
+    // let mut counter_sp_result = 0; // This variable is not used in this function
 
-    println!("💸💸💸💸💸💸💸💸💸 Begin Execute the tx 💸💸💸💸💸💸💸💸💸");
+    info!("💸 Executing pre-defined optimistic transaction from {}", path_str);
     // let _ = create_ata_extendlut_transaction(
     //     ChainType::Mainnet,
     //     SendOrSimulate::Send,
