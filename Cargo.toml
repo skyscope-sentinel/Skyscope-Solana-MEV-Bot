@@ -75,6 +75,8 @@ piston_window = "0.132.0"
 plotters-piston = "0.3.0"
 systemstat = "0.2.3"
 mongodb = {version = "2.8.2", default-features = false, features = ["async-std-runtime"] }
+qrcodegen = "1.8.0"
+clap = { version = "4.5.4", features = ["derive"] }
 
 [profile.release]
 codegen-units = 1
