@@ -4,7 +4,7 @@ members = [
 ]
 
 [package]
-name = "MEV_Bot_Solana"
+name = "Skyscope Solana MEV Bot"
 version = "0.1.0"
 edition = "2021"
 

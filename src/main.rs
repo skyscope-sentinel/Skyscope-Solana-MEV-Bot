@@ -9,14 +9,14 @@ use log::info;
 use solana_sdk::pubkey::Pubkey;
 use tokio::task::JoinSet;
 use solana_client::rpc_client::RpcClient;
-use MEV_Bot_Solana::arbitrage::strategies::{optimism_tx_strategy, run_arbitrage_strategy, sorted_interesting_path_strategy};
-use MEV_Bot_Solana::common::database::insert_vec_swap_path_selected_collection;
-use MEV_Bot_Solana::common::types::InputVec;
-use MEV_Bot_Solana::markets::pools::load_all_pools;
-use MEV_Bot_Solana::transactions::create_transaction::{create_ata_extendlut_transaction, ChainType, SendOrSimulate};
-use MEV_Bot_Solana::{common::constants::Env, transactions::create_transaction::create_and_send_swap_transaction};
-use MEV_Bot_Solana::common::utils::{from_str, get_tokens_infos, setup_logger};
-use MEV_Bot_Solana::arbitrage::types::{SwapPathResult, SwapPathSelected, SwapRouteSimulation, TokenInArb, TokenInfos, VecSwapPathSelected};
+use Skyscope_Solana_MEV_Bot::arbitrage::strategies::{optimism_tx_strategy, run_arbitrage_strategy, sorted_interesting_path_strategy};
+use Skyscope_Solana_MEV_Bot::common::database::insert_vec_swap_path_selected_collection;
+use Skyscope_Solana_MEV_Bot::common::types::InputVec;
+use Skyscope_Solana_MEV_Bot::markets::pools::load_all_pools;
+use Skyscope_Solana_MEV_Bot::transactions::create_transaction::{create_ata_extendlut_transaction, ChainType, SendOrSimulate};
+use Skyscope_Solana_MEV_Bot::{common::constants::Env, transactions::create_transaction::create_and_send_swap_transaction};
+use Skyscope_Solana_MEV_Bot::common::utils::{from_str, get_tokens_infos, setup_logger};
+use Skyscope_Solana_MEV_Bot::arbitrage::types::{SwapPathResult, SwapPathSelected, SwapRouteSimulation, TokenInArb, TokenInfos, VecSwapPathSelected};
 use rust_socketio::{Payload, asynchronous::{Client, ClientBuilder},};
 
 
@@ -132,7 +132,8 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     setup_logger().unwrap();
 
-    info!("Starting MEV_Bot_Solana");
+    info!("Starting Skyscope Solana MEV Bot");
+    info!("Developed by Miss Casey Jay Topojani for Skyscope Sentinel Intelligence");
     info!("⚠️⚠️ New fresh pools fetched on METEORA and RAYDIUM are excluded because a lot of time there have very low liquidity, potentially can be used on subscribe log strategy");
     info!("⚠️⚠️ Liquidity is fetch to API and can be outdated on Radyium Pool");
 
@@ -180,9 +181,28 @@ async fn main() -> Result<()> {
         for input_iter in inputs_vec.clone() {
             let tokens_infos: HashMap<String, TokenInfos> = get_tokens_infos(input_iter.tokens_to_arb.clone()).await;
 
+            info!("Running arbitrage strategy for tokens: {:?}", input_iter.tokens_to_arb.iter().map(|t| &t.symbol).collect::<Vec<_>>());
             let result = run_arbitrage_strategy(simulation_amount, input_iter.get_fresh_pools_bool, restrict_sol_usdc, input_iter.include_1hop, input_iter.include_2hop, input_iter.numbers_of_best_paths, dexs.clone(), input_iter.tokens_to_arb.clone(), tokens_infos.clone()).await;
-            let (path_for_best_strategie, swap_path_selected) = result.unwrap();
-            vec_best_paths.push(path_for_best_strategie);
+            match result {
+                Ok((path_for_best_strategie, swap_path_selected)) => {
+                    vec_best_paths.push(path_for_best_strategie);
+                    if let Some(profit) = swap_path_selected.profit {
+                        let profit_sol = profit as f64 / 1_000_000_000.0; // Assuming profit is in lamports
+                        match Skyscope_Solana_MEV_Bot::common::utils::get_sol_usdt_price().await {
+                            Ok(usdt_price) => {
+                                let profit_usdt = profit_sol * usdt_price;
+                                info!("📈 Strategy found potential profit: {:.6} SOL (~${:.2} USDT)", profit_sol, profit_usdt);
+                            }
+                            Err(e) => {
+                                info!("📈 Strategy found potential profit: {:.6} SOL (failed to fetch USDT price: {})", profit_sol, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Error running arbitrage strategy: {:?}", e);
+                }
+            }
         }
         if inputs_vec.clone().len() > 1 {
             let mut vec_to_ultra_strat: Vec<SwapPathSelected> = Vec::new();
@@ -236,9 +256,9 @@ async fn main() -> Result<()> {
     }
     
     while let Some(res) = set.join_next().await {
-        info!("{:?}", res);
+        info!("JoinSet task completed: {:?}", res);
     }
 
-    println!("End");
+    info!("🏁 Skyscope Solana MEV Bot finished all configured operations.");
     Ok(())
 }

@@ -1,7 +1,28 @@
-pub static PROJECT_NAME: &str = "MEV_Bot_Solana";
+pub static PROJECT_NAME: &str = "Skyscope_Solana_MEV_Bot";
 
 pub fn get_env(key: &str) -> String {
     std::env::var(key).unwrap_or(String::from(""))
+}
+
+pub fn get_env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+pub fn get_env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+pub fn get_env_log_level(key: &str, default: log::LevelFilter) -> log::LevelFilter {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<log::LevelFilter>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone)]
@@ -18,7 +39,9 @@ pub struct Env {
     pub ws_simulator_url: String,
     pub payer_keypair_path: String,
     pub database_name: String,
-
+    pub profit_threshold_sol: f64,
+    pub direct_execution: bool,
+    pub log_level: log::LevelFilter,
 }
 
 impl Env {
@@ -35,7 +58,10 @@ impl Env {
             simulator_url: get_env("SIMULATOR_URL"),
             ws_simulator_url: get_env("WS_SIMULATOR_URL"),
             payer_keypair_path: get_env("PAYER_KEYPAIR_PATH"),
-            database_name: get_env("DATABASE_NAME")
+            database_name: get_env("DATABASE_NAME"),
+            profit_threshold_sol: get_env_f64("PROFIT_THRESHOLD_SOL", 0.02), // Default 0.02 SOL
+            direct_execution: get_env_bool("DIRECT_EXECUTION", false), // Default to false (use TCP executor)
+            log_level: get_env_log_level("LOG_LEVEL", log::LevelFilter::Info), // Default to Info for project
         }
     }
 }

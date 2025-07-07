@@ -9,6 +9,7 @@ use std::{collections::HashMap, fs::{File, OpenOptions}};
 use thiserror::Error;
 use reqwest::Error;
 use std::io::{BufWriter, Write};
+use serde_json::Value;
 
 use crate::{arbitrage::types::{SwapPathResult, TokenInArb, TokenInfos}, common::constants::{
     Env, PROJECT_NAME
@@ -32,16 +33,17 @@ pub fn setup_logger() -> Result<(), fern::InitError> {
     let stdout_config = fern::Dispatch::new()
         .format(move |out, message, record| {
             out.finish(format_args!(
-                "{}[{}] {}",
+                "{}[{}][{}] {}",
                 chrono::Local::now().format("[%H:%M:%S]"),
+                record.target(),
                 colors.color(record.level()),
                 message
             ))
         })
         .chain(std::io::stdout())
-        .level(log::LevelFilter::Error)
-        .level_for(PROJECT_NAME, LevelFilter::Info);
-    
+        .level(log::LevelFilter::Error) // Default for other crates
+        .level_for(PROJECT_NAME, Env::new().log_level); // Configurable for our project
+
     //File logs
     let file_config = fern::Dispatch::new()
         .format(move |out, message, record| {
@@ -55,8 +57,8 @@ pub fn setup_logger() -> Result<(), fern::InitError> {
             ))
         })
         .chain(fern::log_file("logs\\program.log")?)
-        .level(log::LevelFilter::Error)
-        .level_for(PROJECT_NAME, LevelFilter::Info);
+        .level(log::LevelFilter::Error) // Default for other crates in file
+        .level_for(PROJECT_NAME, Env::new().log_level); // Configurable for our project in file
     //Errors logs
     let errors_config = fern::Dispatch::new()
         .format(move |out, message, record| {
@@ -70,12 +72,12 @@ pub fn setup_logger() -> Result<(), fern::InitError> {
             ))
         })
         .chain(fern::log_file("logs\\errors.log")?)
-        .level(log::LevelFilter::Error);
+        .level(log::LevelFilter::Error); // Errors log should capture all errors
 
     base_config
+        .chain(stdout_config) // stdout first for immediate feedback
         .chain(file_config)
         .chain(errors_config)
-        .chain(stdout_config)
         .apply()?;
     Ok(())
 }
@@ -167,4 +169,11 @@ pub struct MintLayout {
     pub is_initialized: bool,
     pub freeze_authority_option: u32,
     pub freeze_authority: Pubkey,
+}
+
+pub async fn get_sol_usdt_price() -> Result<f64, reqwest::Error> {
+    let url = "https://min-api.cryptocompare.com/data/price?fsym=SOL&tsyms=USDT";
+    let response = reqwest::get(url).await?.json::<Value>().await?;
+    let price = response["USDT"].as_f64().unwrap_or(0.0);
+    Ok(price)
 }
