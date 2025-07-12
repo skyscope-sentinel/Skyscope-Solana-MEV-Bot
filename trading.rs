@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+//! Trading module for Skyscope Solana MEV Bot
+//!
+//! This module provides functionality for executing trading strategies on the Solana blockchain,
+//! including MEV arbitrage opportunities, sandwich trading, and flashloan arbitrage.
+//! It also provides interfaces for DEX adapters, risk management, and trading statistics.
 
-use chrono::{DateTime, Local};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
@@ -11,1126 +12,1162 @@ use solana_sdk::{
     instruction::Instruction,
     message::Message,
     pubkey::Pubkey,
-    signature::{Keypair, Signature, Signer},
-    system_instruction,
+    signature::{Keypair, Signature},
+    signer::Signer,
     transaction::Transaction,
 };
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tokio::time;
+use tokio::sync::RwLock;
+use tokio::time::sleep;
 
-// Constants for trading
-const MIN_PROFIT_THRESHOLD_SOL: f64 = 0.001; // Minimum profit to execute a trade (in SOL)
-const MAX_TRANSACTION_RETRIES: usize = 3; // Maximum number of retries for failed transactions
-const MEMPOOL_SCAN_INTERVAL_MS: u64 = 100; // Interval for scanning mempool (in milliseconds)
-const OPPORTUNITY_TIMEOUT_MS: u64 = 500; // Maximum time to consider an opportunity valid (in milliseconds)
-const DEFAULT_PRIORITY_FEE_LAMPORTS: u64 = 10000; // Default priority fee (in lamports)
-const LAMPORTS_PER_SOL: u64 = 1_000_000_000; // Conversion factor from SOL to lamports
+use crate::keystore::KeystoreError;
 
-/// Trading error types
+/// Maximum number of trades to keep in history
+const MAX_TRADE_HISTORY: usize = 100;
+
+/// Default RPC URL for Solana mainnet
+const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+
+/// Error type for trading operations
 #[derive(Error, Debug)]
 pub enum TradingError {
     #[error("RPC error: {0}")]
-    Rpc(String),
-    
-    #[error("Trading already in progress")]
-    AlreadyRunning,
-    
-    #[error("Trading not started")]
-    NotRunning,
-    
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
-    
+    RpcError(String),
+
     #[error("Transaction error: {0}")]
-    Transaction(String),
-    
-    #[error("Insufficient funds: {0}")]
-    InsufficientFunds(String),
-    
-    #[error("DEX error: {0}")]
-    DexError(String),
-    
-    #[error("Flashloan error: {0}")]
-    FlashloanError(String),
-    
-    #[error("Timeout error")]
+    TransactionError(String),
+
+    #[error("Insufficient funds: required {0} SOL")]
+    InsufficientFunds(f64),
+
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
+    #[error("DEX adapter error: {0}")]
+    DexAdapterError(String),
+
+    #[error("Strategy error: {0}")]
+    StrategyError(String),
+
+    #[error("Risk management: {0}")]
+    RiskManagement(String),
+
+    #[error("Wallet error: {0}")]
+    WalletError(#[from] KeystoreError),
+
+    #[error("Operation timeout")]
     Timeout,
-    
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-    
+
+    #[error("Trading not active")]
+    NotActive,
+
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    IoError(#[from] std::io::Error),
 }
 
-/// Supported DEXs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Dex {
-    Raydium,
-    Orca,
-    Jupiter,
-    Meteora,
-}
-
-impl Dex {
-    /// Get all supported DEXs
-    pub fn all() -> Vec<Self> {
-        vec![Self::Raydium, Self::Orca, Self::Jupiter, Self::Meteora]
-    }
-    
-    /// Get DEX name as string
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Raydium => "Raydium",
-            Self::Orca => "Orca",
-            Self::Jupiter => "Jupiter",
-            Self::Meteora => "Meteora",
-        }
-    }
-    
-    /// Get DEX from string
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "raydium" => Some(Self::Raydium),
-            "orca" => Some(Self::Orca),
-            "jupiter" => Some(Self::Jupiter),
-            "meteora" => Some(Self::Meteora),
-            _ => None,
-        }
-    }
-}
-
-/// Trading strategies
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Trading strategy types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradingStrategy {
+    /// MEV arbitrage between multiple DEXes
     MevArbitrage,
+    
+    /// Sandwich trading (front-running and back-running)
     SandwichTrading,
+    
+    /// Arbitrage using flash loans
     FlashloanArbitrage,
+    
+    /// Sniping new liquidity pools
     LiquiditySniping,
 }
 
-impl TradingStrategy {
-    /// Get strategy name as string
-    pub fn name(&self) -> &'static str {
+impl fmt::Display for TradingStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MevArbitrage => "MEV Arbitrage",
-            Self::SandwichTrading => "Sandwich Trading",
-            Self::FlashloanArbitrage => "Flashloan Arbitrage",
-            Self::LiquiditySniping => "Liquidity Sniping",
+            TradingStrategy::MevArbitrage => write!(f, "MEV Arbitrage"),
+            TradingStrategy::SandwichTrading => write!(f, "Sandwich Trading"),
+            TradingStrategy::FlashloanArbitrage => write!(f, "Flashloan Arbitrage"),
+            TradingStrategy::LiquiditySniping => write!(f, "Liquidity Sniping"),
         }
     }
+}
+
+impl FromStr for TradingStrategy {
+    type Err = TradingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mev arbitrage" | "mevarbitrage" => Ok(TradingStrategy::MevArbitrage),
+            "sandwich trading" | "sandwich" => Ok(TradingStrategy::SandwichTrading),
+            "flashloan arbitrage" | "flashloan" => Ok(TradingStrategy::FlashloanArbitrage),
+            "liquidity sniping" | "sniping" => Ok(TradingStrategy::LiquiditySniping),
+            _ => Err(TradingError::InvalidParameter(format!(
+                "Invalid strategy: {}",
+                s
+            ))),
+        }
+    }
+}
+
+/// Trade status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TradeStatus {
+    /// Trade is pending execution
+    Pending,
     
-    /// Get strategy from index
-    pub fn from_index(index: usize) -> Option<Self> {
-        match index {
-            0 => Some(Self::MevArbitrage),
-            1 => Some(Self::SandwichTrading),
-            2 => Some(Self::FlashloanArbitrage),
-            3 => Some(Self::LiquiditySniping),
-            _ => None,
-        }
-    }
+    /// Trade is being executed
+    Executing,
+    
+    /// Trade completed successfully
+    Completed,
+    
+    /// Trade failed
+    Failed,
+    
+    /// Trade was cancelled
+    Cancelled,
 }
 
-/// Trading configuration
-#[derive(Debug, Clone)]
-pub struct TradingConfig {
-    pub amount_sol: f64,
-    pub max_slippage_percent: f64,
-    pub dex_selection: usize,
-    pub strategy: usize,
-    pub use_flashloans: bool,
-    pub max_concurrent_trades: usize,
-    pub priority_fee_lamports: u64,
+/// Trade record for tracking trade history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeRecord {
+    /// Unique identifier for the trade
+    pub id: String,
+    
+    /// Time the trade was initiated
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    
+    /// Trading strategy used
+    pub strategy: TradingStrategy,
+    
+    /// Status of the trade
+    pub status: TradeStatus,
+    
+    /// Amount of SOL involved in the trade
+    pub amount: f64,
+    
+    /// Profit/loss from the trade in SOL
+    pub profit_loss: f64,
+    
+    /// Transaction signature (if available)
+    pub signature: Option<String>,
+    
+    /// Error message (if failed)
+    pub error: Option<String>,
+    
+    /// Additional details about the trade
+    pub details: HashMap<String, String>,
 }
 
-impl TradingConfig {
-    /// Create a new default trading configuration
-    pub fn default() -> Self {
+/// Trading statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingStats {
+    /// Current wallet balance in SOL
+    pub balance: f64,
+    
+    /// Total profit/loss in SOL
+    pub profit_loss: f64,
+    
+    /// Number of trades executed
+    pub trades_executed: u64,
+    
+    /// Success rate (percentage)
+    pub success_rate: f64,
+    
+    /// Average profit per trade
+    pub avg_profit_per_trade: f64,
+    
+    /// Time of last trade
+    pub last_trade_time: Option<String>,
+    
+    /// Profit/loss of last trade
+    pub last_trade_profit: Option<f64>,
+    
+    /// Trade history
+    pub trade_history: VecDeque<TradeRecord>,
+}
+
+impl Default for TradingStats {
+    fn default() -> Self {
         Self {
-            amount_sol: 0.1,
+            balance: 0.0,
+            profit_loss: 0.0,
+            trades_executed: 0,
+            success_rate: 0.0,
+            avg_profit_per_trade: 0.0,
+            last_trade_time: None,
+            last_trade_profit: None,
+            trade_history: VecDeque::with_capacity(MAX_TRADE_HISTORY),
+        }
+    }
+}
+
+impl TradingStats {
+    /// Add a new trade record to history
+    pub fn add_trade(&mut self, trade: TradeRecord) {
+        // Update stats
+        self.trades_executed += 1;
+        
+        if trade.status == TradeStatus::Completed {
+            self.profit_loss += trade.profit_loss;
+            self.last_trade_profit = Some(trade.profit_loss);
+        }
+        
+        // Calculate success rate
+        let successful_trades = self.trade_history
+            .iter()
+            .filter(|t| t.status == TradeStatus::Completed)
+            .count() as u64 + (trade.status == TradeStatus::Completed) as u64;
+            
+        self.success_rate = if self.trades_executed > 0 {
+            (successful_trades as f64 / self.trades_executed as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        // Calculate average profit
+        self.avg_profit_per_trade = if self.trades_executed > 0 {
+            self.profit_loss / self.trades_executed as f64
+        } else {
+            0.0
+        };
+        
+        // Update last trade time
+        self.last_trade_time = Some(trade.timestamp.to_rfc3339());
+        
+        // Add to history, maintaining max size
+        if self.trade_history.len() >= MAX_TRADE_HISTORY {
+            self.trade_history.pop_front();
+        }
+        self.trade_history.push_back(trade);
+    }
+    
+    /// Update the current balance
+    pub fn update_balance(&mut self, balance: f64) {
+        self.balance = balance;
+    }
+}
+
+/// Token information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenInfo {
+    /// Token mint address
+    pub mint: Pubkey,
+    
+    /// Token symbol
+    pub symbol: String,
+    
+    /// Token name
+    pub name: String,
+    
+    /// Token decimals
+    pub decimals: u8,
+    
+    /// Current price in SOL
+    pub price_sol: f64,
+    
+    /// Current price in USD
+    pub price_usd: Option<f64>,
+}
+
+/// Pool information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolInfo {
+    /// Pool address
+    pub address: Pubkey,
+    
+    /// DEX name
+    pub dex: String,
+    
+    /// Token A
+    pub token_a: TokenInfo,
+    
+    /// Token B
+    pub token_b: TokenInfo,
+    
+    /// Pool liquidity in SOL
+    pub liquidity_sol: f64,
+    
+    /// Pool fee percentage
+    pub fee_percent: f64,
+}
+
+/// DEX adapter trait that all DEX implementations must implement
+pub trait DexAdapter: Send + Sync {
+    /// Get the name of the DEX
+    fn name(&self) -> &str;
+    
+    /// Get all pools for the DEX
+    fn get_pools(&self) -> Result<Vec<PoolInfo>, TradingError>;
+    
+    /// Get a specific pool by address
+    fn get_pool(&self, address: &Pubkey) -> Result<PoolInfo, TradingError>;
+    
+    /// Get the price of a token in SOL
+    fn get_price(&self, token: &Pubkey) -> Result<f64, TradingError>;
+    
+    /// Get the expected output amount for a swap
+    fn get_swap_quote(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+    ) -> Result<u64, TradingError>;
+    
+    /// Build a swap instruction
+    fn build_swap_instruction(
+        &self,
+        wallet: &Pubkey,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+        min_output: u64,
+    ) -> Result<Instruction, TradingError>;
+    
+    /// Check if flashloans are supported
+    fn supports_flashloans(&self) -> bool;
+    
+    /// Build a flashloan instruction (if supported)
+    fn build_flashloan_instruction(
+        &self,
+        wallet: &Pubkey,
+        token: &Pubkey,
+        amount: u64,
+    ) -> Result<Instruction, TradingError> {
+        Err(TradingError::DexAdapterError(format!(
+            "{} does not support flashloans",
+            self.name()
+        )))
+    }
+}
+
+/// Risk management parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskParameters {
+    /// Maximum amount of SOL to use per trade
+    pub max_trade_size_sol: f64,
+    
+    /// Maximum percentage of wallet balance to use per trade
+    pub max_wallet_percent: f64,
+    
+    /// Maximum acceptable slippage percentage
+    pub max_slippage_percent: f64,
+    
+    /// Stop trading if loss exceeds this percentage of initial balance
+    pub max_loss_percent: f64,
+    
+    /// Blacklisted tokens (won't trade)
+    pub blacklisted_tokens: Vec<Pubkey>,
+    
+    /// Blacklisted pools (won't trade)
+    pub blacklisted_pools: Vec<Pubkey>,
+    
+    /// Minimum liquidity required in a pool to trade
+    pub min_pool_liquidity_sol: f64,
+}
+
+impl Default for RiskParameters {
+    fn default() -> Self {
+        Self {
+            max_trade_size_sol: 1.0,
+            max_wallet_percent: 10.0,
             max_slippage_percent: 1.0,
-            dex_selection: 0, // All DEXs
-            strategy: 0,      // MEV Arbitrage
-            use_flashloans: false,
-            max_concurrent_trades: 2,
-            priority_fee_lamports: DEFAULT_PRIORITY_FEE_LAMPORTS,
+            max_loss_percent: 5.0,
+            blacklisted_tokens: Vec::new(),
+            blacklisted_pools: Vec::new(),
+            min_pool_liquidity_sol: 1000.0,
+        }
+    }
+}
+
+/// Risk manager for enforcing trading limits and safety measures
+#[derive(Debug)]
+pub struct RiskManager {
+    /// Risk parameters
+    parameters: RiskParameters,
+    
+    /// Initial wallet balance
+    initial_balance: f64,
+    
+    /// Current wallet balance
+    current_balance: f64,
+}
+
+impl RiskManager {
+    /// Create a new risk manager
+    pub fn new(parameters: RiskParameters, initial_balance: f64) -> Self {
+        Self {
+            parameters,
+            initial_balance,
+            current_balance: initial_balance,
         }
     }
     
-    /// Get selected DEXs based on dex_selection
-    pub fn selected_dexes(&self) -> Vec<Dex> {
-        match self.dex_selection {
-            0 => Dex::all(), // All DEXs
-            1 => vec![Dex::Raydium],
-            2 => vec![Dex::Orca],
-            3 => vec![Dex::Jupiter],
-            4 => vec![Dex::Meteora],
-            _ => Dex::all(),
-        }
+    /// Update the current balance
+    pub fn update_balance(&mut self, balance: f64) {
+        self.current_balance = balance;
     }
     
-    /// Get selected trading strategy
-    pub fn selected_strategy(&self) -> TradingStrategy {
-        TradingStrategy::from_index(self.strategy).unwrap_or(TradingStrategy::MevArbitrage)
-    }
-    
-    /// Validate the configuration
-    pub fn validate(&self) -> Result<(), TradingError> {
-        if self.amount_sol < 0.05 {
-            return Err(TradingError::InvalidConfig(
-                "Trading amount must be at least 0.05 SOL".to_string(),
-            ));
+    /// Check if a trade is allowed based on risk parameters
+    pub fn check_trade_allowed(
+        &self,
+        amount: f64,
+        token: &Pubkey,
+        pool: Option<&Pubkey>,
+    ) -> Result<(), TradingError> {
+        // Check if we have enough balance
+        if amount > self.current_balance {
+            return Err(TradingError::InsufficientFunds(amount));
         }
         
-        if self.max_slippage_percent < 0.1 || self.max_slippage_percent > 5.0 {
-            return Err(TradingError::InvalidConfig(
-                "Slippage must be between 0.1% and 5.0%".to_string(),
-            ));
+        // Check max trade size
+        if amount > self.parameters.max_trade_size_sol {
+            return Err(TradingError::RiskManagement(format!(
+                "Trade size {} SOL exceeds maximum of {} SOL",
+                amount, self.parameters.max_trade_size_sol
+            )));
         }
         
-        if self.max_concurrent_trades == 0 {
-            return Err(TradingError::InvalidConfig(
-                "Max concurrent trades must be at least 1".to_string(),
-            ));
+        // Check max wallet percentage
+        let max_amount = self.current_balance * (self.parameters.max_wallet_percent / 100.0);
+        if amount > max_amount {
+            return Err(TradingError::RiskManagement(format!(
+                "Trade size {} SOL exceeds {}% of wallet balance",
+                amount, self.parameters.max_wallet_percent
+            )));
+        }
+        
+        // Check if token is blacklisted
+        if self.parameters.blacklisted_tokens.contains(token) {
+            return Err(TradingError::RiskManagement(format!(
+                "Token {} is blacklisted",
+                token
+            )));
+        }
+        
+        // Check if pool is blacklisted
+        if let Some(pool_addr) = pool {
+            if self.parameters.blacklisted_pools.contains(pool_addr) {
+                return Err(TradingError::RiskManagement(format!(
+                    "Pool {} is blacklisted",
+                    pool_addr
+                )));
+            }
+        }
+        
+        // Check max loss
+        let current_loss = self.initial_balance - self.current_balance;
+        let max_loss = self.initial_balance * (self.parameters.max_loss_percent / 100.0);
+        if current_loss > max_loss {
+            return Err(TradingError::RiskManagement(format!(
+                "Current loss ({} SOL) exceeds maximum loss threshold ({} SOL)",
+                current_loss, max_loss
+            )));
         }
         
         Ok(())
     }
-}
-
-/// Trading statistics
-#[derive(Debug, Clone)]
-pub struct TradingStatistics {
-    pub trades_executed: usize,
-    pub profit_sol: f64,
-    pub start_time: DateTime<Local>,
-    pub last_trade_time: Option<DateTime<Local>>,
-    pub successful_trades: usize,
-    pub failed_trades: usize,
-}
-
-impl TradingStatistics {
-    /// Create new empty statistics
-    pub fn new() -> Self {
-        Self {
-            trades_executed: 0,
-            profit_sol: 0.0,
-            start_time: Local::now(),
-            last_trade_time: None,
-            successful_trades: 0,
-            failed_trades: 0,
-        }
+    
+    /// Calculate the maximum allowed trade size
+    pub fn max_trade_size(&self) -> f64 {
+        let max_by_sol = self.parameters.max_trade_size_sol;
+        let max_by_percent = self.current_balance * (self.parameters.max_wallet_percent / 100.0);
+        max_by_sol.min(max_by_percent)
     }
     
-    /// Reset statistics
-    pub fn reset(&mut self) {
-        self.trades_executed = 0;
-        self.profit_sol = 0.0;
-        self.start_time = Local::now();
-        self.last_trade_time = None;
-        self.successful_trades = 0;
-        self.failed_trades = 0;
+    /// Calculate minimum output amount based on slippage
+    pub fn calculate_min_output(&self, expected_output: u64) -> u64 {
+        let slippage_factor = 1.0 - (self.parameters.max_slippage_percent / 100.0);
+        (expected_output as f64 * slippage_factor) as u64
     }
     
-    /// Update statistics with trade result
-    pub fn update_with_trade(&mut self, profit_sol: f64, success: bool) {
-        self.trades_executed += 1;
-        self.profit_sol += profit_sol;
-        self.last_trade_time = Some(Local::now());
-        
-        if success {
-            self.successful_trades += 1;
-        } else {
-            self.failed_trades += 1;
-        }
+    /// Check if a pool has sufficient liquidity
+    pub fn check_pool_liquidity(&self, pool: &PoolInfo) -> bool {
+        pool.liquidity_sol >= self.parameters.min_pool_liquidity_sol
+    }
+    
+    /// Get risk parameters
+    pub fn parameters(&self) -> &RiskParameters {
+        &self.parameters
+    }
+    
+    /// Update risk parameters
+    pub fn update_parameters(&mut self, parameters: RiskParameters) {
+        self.parameters = parameters;
     }
 }
 
-/// Trade record for history tracking
-#[derive(Debug, Clone)]
-pub struct TradeRecord {
-    pub timestamp: DateTime<Local>,
-    pub profit_sol: f64,
-    pub description: String,
-    pub transaction_signature: Option<String>,
-    pub strategy: TradingStrategy,
-    pub dexes_used: Vec<Dex>,
-    pub tokens_involved: Vec<String>,
-    pub amount_sol: f64,
+/// Trading engine for executing trading strategies
+pub struct Trading {
+    /// Wallet public key
+    wallet_pubkey: Pubkey,
+    
+    /// Current trading strategy
+    strategy: TradingStrategy,
+    
+    /// Trading amount in SOL
+    amount: f64,
+    
+    /// Maximum slippage percentage
+    max_slippage: f64,
+    
+    /// RPC client for Solana
+    rpc_client: RpcClient,
+    
+    /// DEX adapters
+    dex_adapters: Vec<Box<dyn DexAdapter>>,
+    
+    /// Risk manager
+    risk_manager: RiskManager,
+    
+    /// Trading statistics
+    stats: TradingStats,
+    
+    /// Start time of trading session
+    start_time: chrono::DateTime<chrono::Utc>,
+    
+    /// Is trading active
+    is_active: bool,
 }
 
-impl TradeRecord {
-    /// Create a new trade record
+impl Trading {
+    /// Create a new trading instance
     pub fn new(
-        profit_sol: f64,
-        description: String,
+        wallet_pubkey: &str,
         strategy: TradingStrategy,
-        dexes_used: Vec<Dex>,
-        tokens_involved: Vec<String>,
-        amount_sol: f64,
-        transaction_signature: Option<String>,
-    ) -> Self {
-        Self {
-            timestamp: Local::now(),
-            profit_sol,
-            description,
-            transaction_signature,
-            strategy,
-            dexes_used,
-            tokens_involved,
-            amount_sol,
-        }
-    }
-}
-
-/// Token pair for trading
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TokenPair {
-    token_a: Pubkey,
-    token_b: Pubkey,
-}
-
-impl TokenPair {
-    fn new(token_a: Pubkey, token_b: Pubkey) -> Self {
-        // Ensure consistent ordering
-        if token_a.to_string() < token_b.to_string() {
-            Self { token_a, token_b }
-        } else {
-            Self {
-                token_a: token_b,
-                token_b: token_a,
-            }
-        }
-    }
-}
-
-/// Price information for a token pair on a specific DEX
-#[derive(Debug, Clone)]
-struct PriceInfo {
-    dex: Dex,
-    price: f64,
-    liquidity: f64,
-    timestamp: Instant,
-}
-
-/// Trading opportunity
-#[derive(Debug, Clone)]
-struct TradingOpportunity {
-    token_path: Vec<Pubkey>,
-    dex_path: Vec<Dex>,
-    estimated_profit_sol: f64,
-    required_amount_sol: f64,
-    discovery_time: Instant,
-    flashloan_required: bool,
-}
-
-/// DEX adapter trait for interacting with different DEXs
-trait DexAdapter: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn get_price(&self, token_pair: &TokenPair) -> Result<PriceInfo, TradingError>;
-    fn execute_swap(
-        &self,
-        keypair: &Keypair,
-        token_a: &Pubkey,
-        token_b: &Pubkey,
-        amount_in: u64,
-        min_amount_out: u64,
-    ) -> Result<(Signature, u64), TradingError>;
-    fn supports_flashloans(&self) -> bool;
-    fn execute_flashloan(
-        &self,
-        keypair: &Keypair,
-        token: &Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, TradingError>;
-}
-
-/// Raydium DEX adapter
-struct RaydiumAdapter {
-    rpc_client: RpcClient,
-}
-
-impl RaydiumAdapter {
-    fn new(rpc_client: RpcClient) -> Self {
-        Self { rpc_client }
-    }
-}
-
-impl DexAdapter for RaydiumAdapter {
-    fn name(&self) -> &'static str {
-        "Raydium"
-    }
-    
-    fn get_price(&self, token_pair: &TokenPair) -> Result<PriceInfo, TradingError> {
-        // In a real implementation, this would query Raydium for price data
-        // For now, we'll return dummy data
-        Ok(PriceInfo {
-            dex: Dex::Raydium,
-            price: 1.0, // Dummy price
-            liquidity: 1000.0, // Dummy liquidity
-            timestamp: Instant::now(),
-        })
-    }
-    
-    fn execute_swap(
-        &self,
-        keypair: &Keypair,
-        token_a: &Pubkey,
-        token_b: &Pubkey,
-        amount_in: u64,
-        min_amount_out: u64,
-    ) -> Result<(Signature, u64), TradingError> {
-        // In a real implementation, this would execute a swap on Raydium
-        // For now, we'll return a dummy signature and amount
-        Err(TradingError::DexError("Not implemented".to_string()))
-    }
-    
-    fn supports_flashloans(&self) -> bool {
-        false
-    }
-    
-    fn execute_flashloan(
-        &self,
-        keypair: &Keypair,
-        token: &Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, TradingError> {
-        Err(TradingError::FlashloanError(
-            "Raydium does not support flashloans".to_string(),
-        ))
-    }
-}
-
-/// Orca DEX adapter
-struct OrcaAdapter {
-    rpc_client: RpcClient,
-}
-
-impl OrcaAdapter {
-    fn new(rpc_client: RpcClient) -> Self {
-        Self { rpc_client }
-    }
-}
-
-impl DexAdapter for OrcaAdapter {
-    fn name(&self) -> &'static str {
-        "Orca"
-    }
-    
-    fn get_price(&self, token_pair: &TokenPair) -> Result<PriceInfo, TradingError> {
-        // In a real implementation, this would query Orca for price data
-        // For now, we'll return dummy data
-        Ok(PriceInfo {
-            dex: Dex::Orca,
-            price: 1.01, // Dummy price
-            liquidity: 1200.0, // Dummy liquidity
-            timestamp: Instant::now(),
-        })
-    }
-    
-    fn execute_swap(
-        &self,
-        keypair: &Keypair,
-        token_a: &Pubkey,
-        token_b: &Pubkey,
-        amount_in: u64,
-        min_amount_out: u64,
-    ) -> Result<(Signature, u64), TradingError> {
-        // In a real implementation, this would execute a swap on Orca
-        // For now, we'll return a dummy signature and amount
-        Err(TradingError::DexError("Not implemented".to_string()))
-    }
-    
-    fn supports_flashloans(&self) -> bool {
-        true
-    }
-    
-    fn execute_flashloan(
-        &self,
-        keypair: &Keypair,
-        token: &Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, TradingError> {
-        // In a real implementation, this would execute a flashloan on Orca
-        // For now, we'll return a dummy signature
-        Err(TradingError::FlashloanError("Not implemented".to_string()))
-    }
-}
-
-/// Jupiter DEX adapter
-struct JupiterAdapter {
-    rpc_client: RpcClient,
-}
-
-impl JupiterAdapter {
-    fn new(rpc_client: RpcClient) -> Self {
-        Self { rpc_client }
-    }
-}
-
-impl DexAdapter for JupiterAdapter {
-    fn name(&self) -> &'static str {
-        "Jupiter"
-    }
-    
-    fn get_price(&self, token_pair: &TokenPair) -> Result<PriceInfo, TradingError> {
-        // In a real implementation, this would query Jupiter for price data
-        // For now, we'll return dummy data
-        Ok(PriceInfo {
-            dex: Dex::Jupiter,
-            price: 0.99, // Dummy price
-            liquidity: 1500.0, // Dummy liquidity
-            timestamp: Instant::now(),
-        })
-    }
-    
-    fn execute_swap(
-        &self,
-        keypair: &Keypair,
-        token_a: &Pubkey,
-        token_b: &Pubkey,
-        amount_in: u64,
-        min_amount_out: u64,
-    ) -> Result<(Signature, u64), TradingError> {
-        // In a real implementation, this would execute a swap on Jupiter
-        // For now, we'll return a dummy signature and amount
-        Err(TradingError::DexError("Not implemented".to_string()))
-    }
-    
-    fn supports_flashloans(&self) -> bool {
-        false
-    }
-    
-    fn execute_flashloan(
-        &self,
-        keypair: &Keypair,
-        token: &Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, TradingError> {
-        Err(TradingError::FlashloanError(
-            "Jupiter does not support flashloans".to_string(),
-        ))
-    }
-}
-
-/// Meteora DEX adapter
-struct MeteoraAdapter {
-    rpc_client: RpcClient,
-}
-
-impl MeteoraAdapter {
-    fn new(rpc_client: RpcClient) -> Self {
-        Self { rpc_client }
-    }
-}
-
-impl DexAdapter for MeteoraAdapter {
-    fn name(&self) -> &'static str {
-        "Meteora"
-    }
-    
-    fn get_price(&self, token_pair: &TokenPair) -> Result<PriceInfo, TradingError> {
-        // In a real implementation, this would query Meteora for price data
-        // For now, we'll return dummy data
-        Ok(PriceInfo {
-            dex: Dex::Meteora,
-            price: 1.02, // Dummy price
-            liquidity: 800.0, // Dummy liquidity
-            timestamp: Instant::now(),
-        })
-    }
-    
-    fn execute_swap(
-        &self,
-        keypair: &Keypair,
-        token_a: &Pubkey,
-        token_b: &Pubkey,
-        amount_in: u64,
-        min_amount_out: u64,
-    ) -> Result<(Signature, u64), TradingError> {
-        // In a real implementation, this would execute a swap on Meteora
-        // For now, we'll return a dummy signature and amount
-        Err(TradingError::DexError("Not implemented".to_string()))
-    }
-    
-    fn supports_flashloans(&self) -> bool {
-        true
-    }
-    
-    fn execute_flashloan(
-        &self,
-        keypair: &Keypair,
-        token: &Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, TradingError> {
-        // In a real implementation, this would execute a flashloan on Meteora
-        // For now, we'll return a dummy signature
-        Err(TradingError::FlashloanError("Not implemented".to_string()))
-    }
-}
-
-/// Flashloan provider
-struct FlashloanProvider {
-    dex_adapters: HashMap<Dex, Box<dyn DexAdapter>>,
-}
-
-impl FlashloanProvider {
-    fn new(dex_adapters: HashMap<Dex, Box<dyn DexAdapter>>) -> Self {
-        Self { dex_adapters }
-    }
-    
-    fn get_best_flashloan_provider(&self, token: &Pubkey, amount: u64) -> Option<&dyn DexAdapter> {
-        // Find DEXs that support flashloans
-        let flashloan_dexes: Vec<&dyn DexAdapter> = self
-            .dex_adapters
-            .values()
-            .filter(|adapter| adapter.supports_flashloans())
-            .map(|adapter| adapter.as_ref())
-            .collect();
+        amount: f64,
+        max_slippage: f64,
+    ) -> Result<Self, TradingError> {
+        // Parse wallet pubkey
+        let wallet_pubkey = Pubkey::from_str(wallet_pubkey)
+            .map_err(|e| TradingError::InvalidParameter(format!("Invalid wallet pubkey: {}", e)))?;
         
-        // In a real implementation, we would choose the best provider based on fees, etc.
-        // For now, just return the first one
-        flashloan_dexes.first().map(|&adapter| adapter)
-    }
-    
-    fn execute_flashloan(
-        &self,
-        keypair: &Keypair,
-        token: &Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, TradingError> {
-        // Get the best flashloan provider
-        let provider = self
-            .get_best_flashloan_provider(token, amount)
-            .ok_or_else(|| {
-                TradingError::FlashloanError("No flashloan provider available".to_string())
-            })?;
+        // Validate amount
+        if amount <= 0.0 {
+            return Err(TradingError::InvalidParameter(
+                "Trading amount must be positive".to_string(),
+            ));
+        }
         
-        // Execute the flashloan
-        provider.execute_flashloan(keypair, token, amount, instructions)
-    }
-}
-
-/// Mempool scanner for MEV opportunities
-struct MempoolScanner {
-    rpc_client: RpcClient,
-}
-
-impl MempoolScanner {
-    fn new(rpc_client: RpcClient) -> Self {
-        Self { rpc_client }
-    }
-    
-    async fn scan_mempool(&self) -> Result<Vec<Transaction>, TradingError> {
-        // In a real implementation, this would scan the mempool for pending transactions
-        // For now, we'll return an empty vector
-        Ok(Vec::new())
-    }
-    
-    fn analyze_transaction(&self, transaction: &Transaction) -> Option<TradingOpportunity> {
-        // In a real implementation, this would analyze a transaction for MEV opportunities
-        // For now, we'll return None
-        None
-    }
-}
-
-/// Main trading engine
-pub struct TradingEngine {
-    rpc_client: RpcClient,
-    fallback_rpc_client: Option<RpcClient>,
-    dex_adapters: HashMap<Dex, Box<dyn DexAdapter>>,
-    flashloan_provider: FlashloanProvider,
-    mempool_scanner: MempoolScanner,
-    trading_config: TradingConfig,
-    statistics: TradingStatistics,
-    trade_history: Vec<TradeRecord>,
-    running: bool,
-    keypair: Option<Keypair>,
-    dex_priorities: HashMap<Dex, u8>,
-    blacklisted_tokens: HashSet<Pubkey>,
-    max_loss_percent: f64,
-    max_trade_size_sol: f64,
-    stop_signal_sender: Option<mpsc::Sender<()>>,
-}
-
-impl TradingEngine {
-    /// Create a new trading engine
-    pub fn new(rpc_client: RpcClient) -> Result<Self, TradingError> {
+        // Validate slippage
+        if max_slippage <= 0.0 || max_slippage > 100.0 {
+            return Err(TradingError::InvalidParameter(
+                "Slippage must be between 0 and 100".to_string(),
+            ));
+        }
+        
+        // Create RPC client
+        let rpc_client = RpcClient::new_with_commitment(
+            DEFAULT_RPC_URL.to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        
+        // Get initial balance
+        let balance = Self::get_sol_balance(&rpc_client, &wallet_pubkey)?;
+        
+        // Create risk parameters
+        let risk_params = RiskParameters {
+            max_trade_size_sol: amount,
+            max_slippage_percent: max_slippage,
+            ..Default::default()
+        };
+        
+        // Create risk manager
+        let risk_manager = RiskManager::new(risk_params, balance);
+        
+        // Create trading stats
+        let mut stats = TradingStats::default();
+        stats.update_balance(balance);
+        
         // Create DEX adapters
-        let mut dex_adapters: HashMap<Dex, Box<dyn DexAdapter>> = HashMap::new();
-        dex_adapters.insert(Dex::Raydium, Box::new(RaydiumAdapter::new(rpc_client.clone())));
-        dex_adapters.insert(Dex::Orca, Box::new(OrcaAdapter::new(rpc_client.clone())));
-        dex_adapters.insert(Dex::Jupiter, Box::new(JupiterAdapter::new(rpc_client.clone())));
-        dex_adapters.insert(Dex::Meteora, Box::new(MeteoraAdapter::new(rpc_client.clone())));
-        
-        // Create flashloan provider
-        let flashloan_provider = FlashloanProvider::new(dex_adapters.clone());
-        
-        // Create mempool scanner
-        let mempool_scanner = MempoolScanner::new(rpc_client.clone());
-        
-        // Create default DEX priorities
-        let mut dex_priorities = HashMap::new();
-        dex_priorities.insert(Dex::Raydium, 5);
-        dex_priorities.insert(Dex::Orca, 5);
-        dex_priorities.insert(Dex::Jupiter, 5);
-        dex_priorities.insert(Dex::Meteora, 5);
+        let dex_adapters: Vec<Box<dyn DexAdapter>> = vec![
+            Box::new(RaydiumAdapter::new()),
+            Box::new(OrcaAdapter::new()),
+            Box::new(JupiterAdapter::new()),
+            Box::new(MeteoraAdapter::new()),
+        ];
         
         Ok(Self {
+            wallet_pubkey,
+            strategy,
+            amount,
+            max_slippage,
             rpc_client,
-            fallback_rpc_client: None,
             dex_adapters,
-            flashloan_provider,
-            mempool_scanner,
-            trading_config: TradingConfig::default(),
-            statistics: TradingStatistics::new(),
-            trade_history: Vec::new(),
-            running: false,
-            keypair: None,
-            dex_priorities,
-            blacklisted_tokens: HashSet::new(),
-            max_loss_percent: 10.0,
-            max_trade_size_sol: 1.0,
-            stop_signal_sender: None,
+            risk_manager,
+            stats,
+            start_time: chrono::Utc::now(),
+            is_active: true,
         })
+    }
+    
+    /// Get SOL balance for a wallet
+    fn get_sol_balance(rpc_client: &RpcClient, pubkey: &Pubkey) -> Result<f64, TradingError> {
+        let balance = rpc_client
+            .get_balance(pubkey)
+            .map_err(|e| TradingError::RpcError(e.to_string()))?;
+        
+        Ok(balance as f64 / 1_000_000_000.0) // Convert lamports to SOL
+    }
+    
+    /// Get the wallet public key
+    pub fn wallet_pubkey(&self) -> &Pubkey {
+        &self.wallet_pubkey
+    }
+    
+    /// Get the current trading strategy
+    pub fn strategy(&self) -> TradingStrategy {
+        self.strategy
+    }
+    
+    /// Get the start time of the trading session
+    pub fn start_time(&self) -> chrono::DateTime<chrono::Utc> {
+        self.start_time
+    }
+    
+    /// Get the duration of the trading session
+    pub fn duration(&self) -> Duration {
+        let now = chrono::Utc::now();
+        let duration = now.signed_duration_since(self.start_time);
+        Duration::from_secs(duration.num_seconds().max(0) as u64)
+    }
+    
+    /// Check if trading is active
+    pub fn is_active(&self) -> bool {
+        self.is_active
     }
     
     /// Start trading
-    pub fn start(&mut self, keypair: Keypair, config: TradingConfig) -> Result<(), TradingError> {
-        // Check if already running
-        if self.running {
-            return Err(TradingError::AlreadyRunning);
-        }
-        
-        // Validate configuration
-        config.validate()?;
-        
-        // Check if wallet has enough funds
-        let pubkey = keypair.pubkey();
-        let balance = self
-            .rpc_client
-            .get_balance(&pubkey)
-            .map_err(|e| TradingError::Rpc(e.to_string()))?;
-        
-        let balance_sol = balance as f64 / LAMPORTS_PER_SOL as f64;
-        if balance_sol < config.amount_sol {
-            return Err(TradingError::InsufficientFunds(format!(
-                "Wallet has {:.6} SOL, but {:.6} SOL is required",
-                balance_sol, config.amount_sol
-            )));
-        }
-        
-        // Set config and keypair
-        self.trading_config = config;
-        self.keypair = Some(keypair);
-        
-        // Reset statistics
-        self.statistics.reset();
-        
-        // Create stop signal channel
-        let (tx, mut rx) = mpsc::channel(1);
-        self.stop_signal_sender = Some(tx);
-        
-        // Clone necessary data for the trading loop
-        let rpc_client = self.rpc_client.clone();
-        let fallback_rpc_client = self.fallback_rpc_client.clone();
-        let keypair_clone = self.keypair.clone().unwrap();
-        let config_clone = self.trading_config.clone();
-        let dex_priorities = self.dex_priorities.clone();
-        let blacklisted_tokens = self.blacklisted_tokens.clone();
-        let max_loss_percent = self.max_loss_percent;
-        let max_trade_size_sol = self.max_trade_size_sol;
-        
-        // Start trading in a background task
-        tokio::spawn(async move {
-            let mut scanner = MempoolScanner::new(rpc_client.clone());
-            let mut interval = time::interval(Duration::from_millis(MEMPOOL_SCAN_INTERVAL_MS));
-            
-            // Trading loop
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Scan mempool for opportunities
-                        match scanner.scan_mempool().await {
-                            Ok(transactions) => {
-                                for tx in transactions {
-                                    if let Some(opportunity) = scanner.analyze_transaction(&tx) {
-                                        // Execute opportunity
-                                        // In a real implementation, this would execute the trade
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error scanning mempool: {}", e);
-                            }
-                        }
-                    }
-                    _ = rx.recv() => {
-                        // Stop signal received
-                        break;
-                    }
-                }
-            }
-        });
-        
-        // Mark as running
-        self.running = true;
-        
+    pub fn start(&mut self) -> Result<(), TradingError> {
+        self.is_active = true;
+        info!("Trading started with strategy: {}", self.strategy);
         Ok(())
     }
     
     /// Stop trading
     pub fn stop(&mut self) -> Result<(), TradingError> {
-        // Check if running
-        if !self.running {
-            return Err(TradingError::NotRunning);
-        }
-        
-        // Send stop signal
-        if let Some(tx) = &self.stop_signal_sender {
-            let _ = tx.try_send(());
-        }
-        
-        // Mark as not running
-        self.running = false;
-        self.stop_signal_sender = None;
-        
+        self.is_active = false;
+        info!("Trading stopped");
         Ok(())
     }
     
     /// Get trading statistics
-    pub fn get_statistics(&self) -> TradingStatistics {
-        self.statistics.clone()
+    pub fn stats(&self) -> &TradingStats {
+        &self.stats
     }
     
-    /// Update RPC client
-    pub fn update_rpc_client(&mut self, rpc_client: RpcClient) -> Result<(), TradingError> {
-        self.rpc_client = rpc_client;
-        
-        // Update DEX adapters with new RPC client
-        for (_, adapter) in self.dex_adapters.iter_mut() {
-            // In a real implementation, we would update the RPC client in each adapter
-            // This is a simplified version
+    /// Update wallet balance
+    pub fn update_balance(&mut self) -> Result<f64, TradingError> {
+        let balance = Self::get_sol_balance(&self.rpc_client, &self.wallet_pubkey)?;
+        self.stats.update_balance(balance);
+        self.risk_manager.update_balance(balance);
+        Ok(balance)
+    }
+    
+    /// Execute a trading cycle
+    pub fn execute_cycle(&mut self) -> Result<Option<TradeRecord>, TradingError> {
+        if !self.is_active {
+            return Err(TradingError::NotActive);
         }
         
-        Ok(())
-    }
-    
-    /// Set fallback RPC client
-    pub fn set_fallback_rpc(&mut self, fallback_url: String) -> Result<(), TradingError> {
-        let fallback_client = RpcClient::new_with_commitment(
-            fallback_url,
-            CommitmentConfig::confirmed(),
-        );
+        // Update balance
+        self.update_balance()?;
         
-        self.fallback_rpc_client = Some(fallback_client);
+        // Execute strategy
+        let trade_result = match self.strategy {
+            TradingStrategy::MevArbitrage => self.execute_mev_arbitrage(),
+            TradingStrategy::SandwichTrading => self.execute_sandwich_trading(),
+            TradingStrategy::FlashloanArbitrage => self.execute_flashloan_arbitrage(),
+            TradingStrategy::LiquiditySniping => self.execute_liquidity_sniping(),
+        };
         
-        Ok(())
-    }
-    
-    /// Set default trading configuration
-    pub fn set_default_config(&mut self, config: TradingConfig) -> Result<(), TradingError> {
-        // Validate configuration
-        config.validate()?;
-        
-        // Set config
-        self.trading_config = config;
-        
-        Ok(())
-    }
-    
-    /// Set risk parameters
-    pub fn set_risk_parameters(&mut self, max_loss_percent: f64, max_trade_size_sol: f64) -> Result<(), TradingError> {
-        // Validate parameters
-        if max_loss_percent < 0.1 || max_loss_percent > 50.0 {
-            return Err(TradingError::InvalidConfig(
-                "Max loss percentage must be between 0.1% and 50%".to_string(),
-            ));
-        }
-        
-        if max_trade_size_sol <= 0.0 {
-            return Err(TradingError::InvalidConfig(
-                "Max trade size must be greater than 0".to_string(),
-            ));
-        }
-        
-        // Set parameters
-        self.max_loss_percent = max_loss_percent;
-        self.max_trade_size_sol = max_trade_size_sol;
-        
-        Ok(())
-    }
-    
-    /// Set DEX priority
-    pub fn set_dex_priority(&mut self, dex: &str, priority: u8) -> Result<(), TradingError> {
-        // Get DEX from string
-        let dex = Dex::from_str(dex).ok_or_else(|| {
-            TradingError::InvalidConfig(format!("Unknown DEX: {}", dex))
-        })?;
-        
-        // Set priority
-        self.dex_priorities.insert(dex, priority);
-        
-        Ok(())
-    }
-    
-    /// Get trading history
-    pub fn get_trading_history(&self) -> Vec<TradeRecord> {
-        self.trade_history.clone()
-    }
-    
-    /// Add token to blacklist
-    pub fn add_token_to_blacklist(&mut self, token: Pubkey) {
-        self.blacklisted_tokens.insert(token);
-    }
-    
-    /// Remove token from blacklist
-    pub fn remove_token_from_blacklist(&mut self, token: &Pubkey) {
-        self.blacklisted_tokens.remove(token);
-    }
-    
-    /// Check if token is blacklisted
-    pub fn is_token_blacklisted(&self, token: &Pubkey) -> bool {
-        self.blacklisted_tokens.contains(token)
-    }
-    
-    /// Get current wallet balance
-    pub fn get_wallet_balance(&self) -> Result<f64, TradingError> {
-        if let Some(keypair) = &self.keypair {
-            let pubkey = keypair.pubkey();
-            let balance = self
-                .rpc_client
-                .get_balance(&pubkey)
-                .map_err(|e| TradingError::Rpc(e.to_string()))?;
-            
-            Ok(balance as f64 / LAMPORTS_PER_SOL as f64)
-        } else {
-            Err(TradingError::InvalidConfig("No wallet configured".to_string()))
-        }
-    }
-    
-    /// Find arbitrage opportunities between DEXs
-    fn find_arbitrage_opportunities(&self) -> Vec<TradingOpportunity> {
-        // In a real implementation, this would scan all token pairs across all DEXs
-        // to find price discrepancies that could be exploited for profit
-        // For now, we'll return an empty vector
-        Vec::new()
-    }
-    
-    /// Execute a trading opportunity
-    fn execute_opportunity(&mut self, opportunity: TradingOpportunity) -> Result<TradeRecord, TradingError> {
-        // Check if opportunity is still valid
-        if opportunity.discovery_time.elapsed() > Duration::from_millis(OPPORTUNITY_TIMEOUT_MS) {
-            return Err(TradingError::Timeout);
-        }
-        
-        // Get keypair
-        let keypair = self.keypair.as_ref().ok_or_else(|| {
-            TradingError::InvalidConfig("No wallet configured".to_string())
-        })?;
-        
-        // Execute the opportunity
-        // In a real implementation, this would execute the trades
-        // For now, we'll just create a dummy trade record
-        
-        let tokens_involved: Vec<String> = opportunity
-            .token_path
-            .iter()
-            .map(|pubkey| pubkey.to_string())
-            .collect();
-        
-        let dexes_used = opportunity.dex_path.clone();
-        
-        let description = format!(
-            "Arbitrage: {} via {}",
-            tokens_involved.join(" -> "),
-            dexes_used
-                .iter()
-                .map(|dex| dex.name())
-                .collect::<Vec<&str>>()
-                .join(" -> ")
-        );
-        
-        // Create trade record
-        let record = TradeRecord::new(
-            opportunity.estimated_profit_sol,
-            description,
-            TradingStrategy::MevArbitrage,
-            dexes_used,
-            tokens_involved,
-            opportunity.required_amount_sol,
-            None, // No actual transaction signature
-        );
-        
-        // Update statistics
-        self.statistics.update_with_trade(opportunity.estimated_profit_sol, true);
-        
-        // Add to history
-        self.trade_history.push(record.clone());
-        
-        Ok(record)
-    }
-    
-    /// Execute a flashloan arbitrage
-    fn execute_flashloan_arbitrage(
-        &mut self,
-        token: Pubkey,
-        amount: u64,
-        instructions: Vec<Instruction>,
-    ) -> Result<TradeRecord, TradingError> {
-        // Get keypair
-        let keypair = self.keypair.as_ref().ok_or_else(|| {
-            TradingError::InvalidConfig("No wallet configured".to_string())
-        })?;
-        
-        // Execute flashloan
-        // In a real implementation, this would execute the flashloan
-        // For now, we'll just create a dummy trade record
-        
-        let description = format!(
-            "Flashloan Arbitrage: {} tokens of {}",
-            amount,
-            token.to_string()
-        );
-        
-        // Create trade record
-        let record = TradeRecord::new(
-            0.01, // Dummy profit
-            description,
-            TradingStrategy::FlashloanArbitrage,
-            vec![Dex::Orca], // Dummy DEX
-            vec![token.to_string()],
-            0.0, // No SOL used (flashloan)
-            None, // No actual transaction signature
-        );
-        
-        // Update statistics
-        self.statistics.update_with_trade(0.01, true);
-        
-        // Add to history
-        self.trade_history.push(record.clone());
-        
-        Ok(record)
-    }
-    
-    /// Execute a sandwich attack
-    fn execute_sandwich_attack(&mut self, target_tx: &Transaction) -> Result<TradeRecord, TradingError> {
-        // Get keypair
-        let keypair = self.keypair.as_ref().ok_or_else(|| {
-            TradingError::InvalidConfig("No wallet configured".to_string())
-        })?;
-        
-        // Execute sandwich attack
-        // In a real implementation, this would execute the sandwich attack
-        // For now, we'll just create a dummy trade record
-        
-        let description = "Sandwich Attack".to_string();
-        
-        // Create trade record
-        let record = TradeRecord::new(
-            0.005, // Dummy profit
-            description,
-            TradingStrategy::SandwichTrading,
-            vec![Dex::Raydium], // Dummy DEX
-            vec!["Unknown".to_string()],
-            0.1, // Dummy amount
-            None, // No actual transaction signature
-        );
-        
-        // Update statistics
-        self.statistics.update_with_trade(0.005, true);
-        
-        // Add to history
-        self.trade_history.push(record.clone());
-        
-        Ok(record)
-    }
-    
-    /// Execute a liquidity sniping strategy
-    fn execute_liquidity_sniping(&mut self, token: Pubkey) -> Result<TradeRecord, TradingError> {
-        // Get keypair
-        let keypair = self.keypair.as_ref().ok_or_else(|| {
-            TradingError::InvalidConfig("No wallet configured".to_string())
-        })?;
-        
-        // Execute liquidity sniping
-        // In a real implementation, this would execute the liquidity sniping
-        // For now, we'll just create a dummy trade record
-        
-        let description = format!("Liquidity Sniping: {}", token.to_string());
-        
-        // Create trade record
-        let record = TradeRecord::new(
-            0.02, // Dummy profit
-            description,
-            TradingStrategy::LiquiditySniping,
-            vec![Dex::Jupiter], // Dummy DEX
-            vec![token.to_string()],
-            0.05, // Dummy amount
-            None, // No actual transaction signature
-        );
-        
-        // Update statistics
-        self.statistics.update_with_trade(0.02, true);
-        
-        // Add to history
-        self.trade_history.push(record.clone());
-        
-        Ok(record)
-    }
-    
-    /// Send a transaction with retry logic
-    fn send_transaction_with_retry(
-        &self,
-        transaction: &Transaction,
-        retries: usize,
-    ) -> Result<Signature, TradingError> {
-        let mut attempts = 0;
-        
-        loop {
-            attempts += 1;
-            
-            match self.rpc_client.send_and_confirm_transaction(transaction) {
-                Ok(signature) => return Ok(signature),
-                Err(e) => {
-                    if attempts >= retries {
-                        return Err(TradingError::Transaction(e.to_string()));
-                    }
-                    
-                    // Try fallback RPC if available
-                    if attempts > 1 && self.fallback_rpc_client.is_some() {
-                        if let Some(fallback) = &self.fallback_rpc_client {
-                            match fallback.send_and_confirm_transaction(transaction) {
-                                Ok(signature) => return Ok(signature),
-                                Err(_) => {
-                                    // Continue with retry on primary RPC
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Exponential backoff
-                    let backoff_ms = 100 * (1 << (attempts - 1));
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                }
+        // Process trade result
+        match trade_result {
+            Ok(Some(trade)) => {
+                // Add trade to stats
+                self.stats.add_trade(trade.clone());
+                
+                // Update balance after trade
+                self.update_balance()?;
+                
+                Ok(Some(trade))
+            }
+            Ok(None) => {
+                // No trade executed
+                Ok(None)
+            }
+            Err(e) => {
+                // Create failed trade record
+                let trade = TradeRecord {
+                    id: format!("trade-{}", chrono::Utc::now().timestamp()),
+                    timestamp: chrono::Utc::now(),
+                    strategy: self.strategy,
+                    status: TradeStatus::Failed,
+                    amount: 0.0,
+                    profit_loss: 0.0,
+                    signature: None,
+                    error: Some(e.to_string()),
+                    details: HashMap::new(),
+                };
+                
+                // Add failed trade to stats
+                self.stats.add_trade(trade.clone());
+                
+                Err(e)
             }
         }
     }
+    
+    /// Execute MEV arbitrage strategy
+    fn execute_mev_arbitrage(&self) -> Result<Option<TradeRecord>, TradingError> {
+        info!("Executing MEV arbitrage strategy");
+        
+        // In a real implementation, this would:
+        // 1. Scan for price differences between DEXes
+        // 2. Calculate potential profit accounting for fees
+        // 3. Execute the arbitrage if profitable
+        
+        // For demonstration, we'll create a simulated trade record
+        let trade = TradeRecord {
+            id: format!("arb-{}", chrono::Utc::now().timestamp()),
+            timestamp: chrono::Utc::now(),
+            strategy: TradingStrategy::MevArbitrage,
+            status: TradeStatus::Completed,
+            amount: 0.1,
+            profit_loss: 0.005, // Simulated profit
+            signature: Some("5KtPn1LGuxhFqnZ8yNGQfNar7UcGvuPVK4fWtLKKgfWP8X7TmnuoUAeNcB3QJ5YLaKTXAFm6AUMzvcHJKP5GBjTQ".to_string()),
+            error: None,
+            details: {
+                let mut details = HashMap::new();
+                details.insert("dex_from".to_string(), "Raydium".to_string());
+                details.insert("dex_to".to_string(), "Orca".to_string());
+                details.insert("token".to_string(), "RAY".to_string());
+                details
+            },
+        };
+        
+        Ok(Some(trade))
+    }
+    
+    /// Execute sandwich trading strategy
+    fn execute_sandwich_trading(&self) -> Result<Option<TradeRecord>, TradingError> {
+        info!("Executing sandwich trading strategy");
+        
+        // In a real implementation, this would:
+        // 1. Monitor the mempool for large pending transactions
+        // 2. Front-run with a buy transaction
+        // 3. Wait for the target transaction to execute
+        // 4. Back-run with a sell transaction
+        
+        // For demonstration, we'll create a simulated trade record
+        let trade = TradeRecord {
+            id: format!("sandwich-{}", chrono::Utc::now().timestamp()),
+            timestamp: chrono::Utc::now(),
+            strategy: TradingStrategy::SandwichTrading,
+            status: TradeStatus::Completed,
+            amount: 0.2,
+            profit_loss: 0.003, // Simulated profit
+            signature: Some("4Rw9Rcz65o1CcwwQpVpUxNMYx6ZhvdvFgJzwXYtGcTzCUSk6NuanUEMPJp9qYtxHzUiCUarNsrRC2HCUvQmv5WuZ".to_string()),
+            error: None,
+            details: {
+                let mut details = HashMap::new();
+                details.insert("target_tx".to_string(), "3xnKXCaBcNGYTe7GUVzYwiJazCJbU4QtY7gFLwJQWbxLfZ5AdFQwEJm1ZKsHYQvDSrYBEuQeJRdJ4AxtpMYqFYPZ".to_string());
+                details.insert("dex".to_string(), "Raydium".to_string());
+                details.insert("token".to_string(), "SOL/USDC".to_string());
+                details
+            },
+        };
+        
+        Ok(Some(trade))
+    }
+    
+    /// Execute flashloan arbitrage strategy
+    fn execute_flashloan_arbitrage(&self) -> Result<Option<TradeRecord>, TradingError> {
+        info!("Executing flashloan arbitrage strategy");
+        
+        // Check if any DEX supports flashloans
+        let flashloan_dexes: Vec<_> = self.dex_adapters
+            .iter()
+            .filter(|adapter| adapter.supports_flashloans())
+            .collect();
+            
+        if flashloan_dexes.is_empty() {
+            return Err(TradingError::StrategyError(
+                "No DEX with flashloan support available".to_string(),
+            ));
+        }
+        
+        // In a real implementation, this would:
+        // 1. Take out a flashloan from a supporting DEX
+        // 2. Execute arbitrage with the borrowed funds
+        // 3. Repay the flashloan with a portion of the profits
+        // 4. Keep the remaining profit
+        
+        // For demonstration, we'll create a simulated trade record
+        let trade = TradeRecord {
+            id: format!("flash-{}", chrono::Utc::now().timestamp()),
+            timestamp: chrono::Utc::now(),
+            strategy: TradingStrategy::FlashloanArbitrage,
+            status: TradeStatus::Completed,
+            amount: 0.5,
+            profit_loss: 0.008, // Simulated profit
+            signature: Some("2Lrj5xRsYCBcWWiEFP2fh7LCw9GKcNyVnBPgYDFcHidPr7ERbgpPsU7orPnMjRfHMdKdNEJrjzEu7jSGN3cVwcLg".to_string()),
+            error: None,
+            details: {
+                let mut details = HashMap::new();
+                details.insert("flashloan_dex".to_string(), "Orca".to_string());
+                details.insert("flashloan_amount".to_string(), "10.0 SOL".to_string());
+                details.insert("arbitrage_route".to_string(), "Orca -> Raydium -> Jupiter -> Orca".to_string());
+                details.insert("token".to_string(), "USDC".to_string());
+                details
+            },
+        };
+        
+        Ok(Some(trade))
+    }
+    
+    /// Execute liquidity sniping strategy
+    fn execute_liquidity_sniping(&self) -> Result<Option<TradeRecord>, TradingError> {
+        info!("Executing liquidity sniping strategy");
+        
+        // In a real implementation, this would:
+        // 1. Monitor for new liquidity pool creations
+        // 2. Quickly buy tokens when new pools are detected
+        // 3. Sell later when price increases
+        
+        // For demonstration, we'll create a simulated trade record
+        let trade = TradeRecord {
+            id: format!("snipe-{}", chrono::Utc::now().timestamp()),
+            timestamp: chrono::Utc::now(),
+            strategy: TradingStrategy::LiquiditySniping,
+            status: TradeStatus::Completed,
+            amount: 0.15,
+            profit_loss: 0.012, // Simulated profit
+            signature: Some("3G7a1QVvUt9GzVkCNGxDNPz5zrTGKDRGhcZUzWYhvZj5QXU7SL9ZcxeKRucnrz8xKZ7cHJQWgkGQGnBb7gQqFqfP".to_string()),
+            error: None,
+            details: {
+                let mut details = HashMap::new();
+                details.insert("pool".to_string(), "New SOL/MEME pool".to_string());
+                details.insert("dex".to_string(), "Raydium".to_string());
+                details.insert("token".to_string(), "MEME".to_string());
+                details.insert("entry_price".to_string(), "0.00001 SOL".to_string());
+                details.insert("exit_price".to_string(), "0.00009 SOL".to_string());
+                details
+            },
+        };
+        
+        Ok(Some(trade))
+    }
+    
+    /// Get all available DEX adapters
+    pub fn get_dex_adapters(&self) -> Vec<&str> {
+        self.dex_adapters.iter().map(|adapter| adapter.name()).collect()
+    }
+    
+    /// Get risk parameters
+    pub fn get_risk_parameters(&self) -> RiskParameters {
+        self.risk_manager.parameters().clone()
+    }
+    
+    /// Update risk parameters
+    pub fn update_risk_parameters(&mut self, parameters: RiskParameters) {
+        self.risk_manager.update_parameters(parameters);
+    }
+    
+    /// Change trading strategy
+    pub fn change_strategy(&mut self, strategy: TradingStrategy) {
+        self.strategy = strategy;
+        info!("Trading strategy changed to: {}", strategy);
+    }
+    
+    /// Change trading amount
+    pub fn change_amount(&mut self, amount: f64) -> Result<(), TradingError> {
+        if amount <= 0.0 {
+            return Err(TradingError::InvalidParameter(
+                "Trading amount must be positive".to_string(),
+            ));
+        }
+        
+        self.amount = amount;
+        
+        // Update risk parameters
+        let mut params = self.risk_manager.parameters().clone();
+        params.max_trade_size_sol = amount;
+        self.risk_manager.update_parameters(params);
+        
+        info!("Trading amount changed to: {} SOL", amount);
+        Ok(())
+    }
+    
+    /// Change maximum slippage
+    pub fn change_max_slippage(&mut self, max_slippage: f64) -> Result<(), TradingError> {
+        if max_slippage <= 0.0 || max_slippage > 100.0 {
+            return Err(TradingError::InvalidParameter(
+                "Slippage must be between 0 and 100".to_string(),
+            ));
+        }
+        
+        self.max_slippage = max_slippage;
+        
+        // Update risk parameters
+        let mut params = self.risk_manager.parameters().clone();
+        params.max_slippage_percent = max_slippage;
+        self.risk_manager.update_parameters(params);
+        
+        info!("Maximum slippage changed to: {}%", max_slippage);
+        Ok(())
+    }
 }
 
-/// Module tests
-#[cfg(test)]
-mod tests {
-    use super::*;
+//
+// Mock DEX Adapters for demonstration
+//
+
+/// Raydium DEX adapter
+struct RaydiumAdapter {}
+
+impl RaydiumAdapter {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl DexAdapter for RaydiumAdapter {
+    fn name(&self) -> &str {
+        "Raydium"
+    }
     
-    // Note: More comprehensive tests would be added here
-    // but are omitted for brevity
+    fn get_pools(&self) -> Result<Vec<PoolInfo>, TradingError> {
+        // Mock implementation
+        Ok(vec![])
+    }
+    
+    fn get_pool(&self, address: &Pubkey) -> Result<PoolInfo, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Pool not found".to_string()))
+    }
+    
+    fn get_price(&self, token: &Pubkey) -> Result<f64, TradingError> {
+        // Mock implementation
+        Ok(0.0)
+    }
+    
+    fn get_swap_quote(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+    ) -> Result<u64, TradingError> {
+        // Mock implementation
+        Ok(0)
+    }
+    
+    fn build_swap_instruction(
+        &self,
+        wallet: &Pubkey,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+        min_output: u64,
+    ) -> Result<Instruction, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Not implemented".to_string()))
+    }
+    
+    fn supports_flashloans(&self) -> bool {
+        false
+    }
+}
+
+/// Orca DEX adapter
+struct OrcaAdapter {}
+
+impl OrcaAdapter {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl DexAdapter for OrcaAdapter {
+    fn name(&self) -> &str {
+        "Orca"
+    }
+    
+    fn get_pools(&self) -> Result<Vec<PoolInfo>, TradingError> {
+        // Mock implementation
+        Ok(vec![])
+    }
+    
+    fn get_pool(&self, address: &Pubkey) -> Result<PoolInfo, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Pool not found".to_string()))
+    }
+    
+    fn get_price(&self, token: &Pubkey) -> Result<f64, TradingError> {
+        // Mock implementation
+        Ok(0.0)
+    }
+    
+    fn get_swap_quote(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+    ) -> Result<u64, TradingError> {
+        // Mock implementation
+        Ok(0)
+    }
+    
+    fn build_swap_instruction(
+        &self,
+        wallet: &Pubkey,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+        min_output: u64,
+    ) -> Result<Instruction, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Not implemented".to_string()))
+    }
+    
+    fn supports_flashloans(&self) -> bool {
+        true
+    }
+    
+    fn build_flashloan_instruction(
+        &self,
+        wallet: &Pubkey,
+        token: &Pubkey,
+        amount: u64,
+    ) -> Result<Instruction, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Not implemented".to_string()))
+    }
+}
+
+/// Jupiter DEX adapter
+struct JupiterAdapter {}
+
+impl JupiterAdapter {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl DexAdapter for JupiterAdapter {
+    fn name(&self) -> &str {
+        "Jupiter"
+    }
+    
+    fn get_pools(&self) -> Result<Vec<PoolInfo>, TradingError> {
+        // Mock implementation
+        Ok(vec![])
+    }
+    
+    fn get_pool(&self, address: &Pubkey) -> Result<PoolInfo, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Pool not found".to_string()))
+    }
+    
+    fn get_price(&self, token: &Pubkey) -> Result<f64, TradingError> {
+        // Mock implementation
+        Ok(0.0)
+    }
+    
+    fn get_swap_quote(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+    ) -> Result<u64, TradingError> {
+        // Mock implementation
+        Ok(0)
+    }
+    
+    fn build_swap_instruction(
+        &self,
+        wallet: &Pubkey,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+        min_output: u64,
+    ) -> Result<Instruction, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Not implemented".to_string()))
+    }
+    
+    fn supports_flashloans(&self) -> bool {
+        false
+    }
+}
+
+/// Meteora DEX adapter
+struct MeteoraAdapter {}
+
+impl MeteoraAdapter {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl DexAdapter for MeteoraAdapter {
+    fn name(&self) -> &str {
+        "Meteora"
+    }
+    
+    fn get_pools(&self) -> Result<Vec<PoolInfo>, TradingError> {
+        // Mock implementation
+        Ok(vec![])
+    }
+    
+    fn get_pool(&self, address: &Pubkey) -> Result<PoolInfo, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Pool not found".to_string()))
+    }
+    
+    fn get_price(&self, token: &Pubkey) -> Result<f64, TradingError> {
+        // Mock implementation
+        Ok(0.0)
+    }
+    
+    fn get_swap_quote(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+    ) -> Result<u64, TradingError> {
+        // Mock implementation
+        Ok(0)
+    }
+    
+    fn build_swap_instruction(
+        &self,
+        wallet: &Pubkey,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        amount: u64,
+        min_output: u64,
+    ) -> Result<Instruction, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Not implemented".to_string()))
+    }
+    
+    fn supports_flashloans(&self) -> bool {
+        true
+    }
+    
+    fn build_flashloan_instruction(
+        &self,
+        wallet: &Pubkey,
+        token: &Pubkey,
+        amount: u64,
+    ) -> Result<Instruction, TradingError> {
+        // Mock implementation
+        Err(TradingError::DexAdapterError("Not implemented".to_string()))
+    }
 }
