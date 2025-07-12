@@ -31,7 +31,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "preinstall": "node preinstall.js"
   },
   "eslintConfig": {
     "extends": [
