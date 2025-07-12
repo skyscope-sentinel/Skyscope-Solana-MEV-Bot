@@ -98,14 +98,6 @@ check_dependencies() {
     rustup update
   fi
   
-  # Check for Node.js and npm
-  if ! command_exists node || ! command_exists npm; then
-    log "INFO" "Installing Node.js and npm..."
-    brew install node
-  else
-    log "INFO" "Node.js and npm are already installed."
-  fi
-  
   # Check for Tauri CLI
   if ! command_exists cargo-tauri; then
     log "INFO" "Installing Tauri CLI..."
