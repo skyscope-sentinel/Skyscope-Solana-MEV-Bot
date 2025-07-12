@@ -1,10 +1,11 @@
 {
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/1.x/tooling/cli/schema.json",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
-    "devPath": "http://localhost:3000",
-    "distDir": "../dist",
-    "withGlobalTauri": false
+    "devPath": "http://localhost:1420",
+    "distDir": "../frontend/dist",
+    "withGlobalTauri": true
   },
   "package": {
     "productName": "Skyscope Solana MEV Bot",
@@ -19,9 +20,6 @@
       },
       "dialog": {
         "all": true,
-        "ask": true,
-        "confirm": true,
-        "message": true,
         "open": true,
         "save": true
       },
@@ -30,68 +28,31 @@
         "readFile": true,
         "writeFile": true,
         "readDir": true,
-        "copyFile": true,
         "createDir": true,
-        "removeDir": true,
-        "removeFile": true,
-        "renameFile": true,
-        "exists": true,
-        "scope": ["$HOME/.skyscope/**", "$APPDATA/.skyscope/**"]
+        "scope": ["$APP/*", "$HOME/.skyscope/*"]
       },
       "path": {
         "all": true
       },
       "os": {
-        "all": false,
-        "home": true
-      },
-      "clipboard": {
-        "writeText": true
+        "all": true
       },
       "notification": {
         "all": true
       },
-      "process": {
-        "all": false,
-        "exit": true,
-        "relaunch": true
-      },
       "window": {
-        "all": false,
-        "center": true,
-        "close": true,
-        "create": false,
-        "hide": true,
-        "maximize": true,
-        "minimize": true,
-        "print": false,
-        "requestUserAttention": true,
-        "setAlwaysOnTop": true,
-        "setCursorGrab": false,
-        "setCursorIcon": false,
-        "setCursorPosition": false,
-        "setCursorVisible": false,
-        "setDecorations": true,
-        "setFocus": true,
-        "setFullscreen": true,
-        "setIcon": true,
-        "setMaxSize": true,
-        "setMinSize": true,
-        "setPosition": true,
-        "setResizable": true,
-        "setSize": true,
-        "setSkipTaskbar": false,
-        "setTitle": true,
-        "show": true,
-        "startDragging": true,
-        "unmaximize": true,
-        "unminimize": true
+        "all": true
+      },
+      "process": {
+        "exit": true
+      },
+      "clipboard": {
+        "writeText": true,
+        "readText": true
       }
     },
     "bundle": {
       "active": true,
-      "targets": "all",
-      "identifier": "io.skyscope.solanamevbot",
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",
@@ -99,40 +60,27 @@
         "icons/icon.icns",
         "icons/icon.ico"
       ],
-      "category": "Finance",
-      "copyright": "© 2025 Skyscope Sentinel Intelligence",
-      "shortDescription": "Solana MEV Trading Bot",
-      "longDescription": "A secure, modular, high-performance trading bot that automatically captures Maximal Extractable Value (MEV) opportunities on the Solana blockchain.",
-      "deb": {
-        "depends": []
-      },
+      "identifier": "ai.skyscope.mevbot",
+      "targets": ["dmg", "app"],
       "macOS": {
-        "frameworks": [],
-        "minimumSystemVersion": "10.13",
-        "exceptionDomain": "",
-        "signingIdentity": null,
         "entitlements": null,
+        "exceptionDomain": "",
+        "frameworks": [],
         "providerShortName": null,
-        "notarize": false
-      },
-      "resources": [],
-      "externalBin": [],
-      "windows": {
-        "certificateThumbprint": null,
-        "digestAlgorithm": "sha256",
-        "timestampUrl": ""
+        "signingIdentity": null,
+        "minimumSystemVersion": "10.15",
+        "universal": true,
+        "webviewInstallMode": {
+          "silent": true,
+          "type": "downloadBootstrapper"
+        }
       }
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' https://*.solana.com wss://*.solana.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
     },
     "updater": {
-      "active": true,
-      "endpoints": [
-        "https://releases.skyscope.io/solanamevbot/{{target}}/{{current_version}}"
-      ],
-      "dialog": true,
-      "pubkey": ""
+      "active": false
     },
     "windows": [
       {
@@ -144,20 +92,10 @@
         "decorations": true,
         "transparent": false,
         "center": true,
-        "focus": true,
-        "minWidth": 800,
-        "minHeight": 600,
         "theme": "Dark",
-        "hiddenTitle": false,
-        "titleBarStyle": "Transparent",
-        "shadow": true
+        "minWidth": 900,
+        "minHeight": 600
       }
-    ],
-    "systemTray": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true,
-      "menuOnLeftClick": false
-    },
-    "macOSPrivateApi": true
+    ]
   }
 }
