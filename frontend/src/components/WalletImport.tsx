@@ -1,866 +1,457 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
-import { open } from '@tauri-apps/api/dialog';
-import { readTextFile } from '@tauri-apps/api/fs';
-import styled from 'styled-components';
+import { dialog } from '@tauri-apps/api';
+import './WalletImport.css';
 
-// Styled components
-const WizardContainer = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: ${({ theme }) => theme.spacing.md};
-  width: 100%;
-  max-width: 600px;
-  margin: 0 auto;
-`;
+type ImportMethod = 'solflare' | 'seedphrase' | 'keypair';
+type Step = 'method' | 'solflare' | 'seedphrase' | 'keypair' | 'pin' | 'complete';
 
-const WizardHeader = styled.div`
-  text-align: center;
-  margin-bottom: ${({ theme }) => theme.spacing.lg};
-  
-  h2 {
-    font-size: ${({ theme }) => theme.fontSizes.xl};
-    margin-bottom: ${({ theme }) => theme.spacing.sm};
-    background: linear-gradient(45deg, ${({ theme }) => theme.colors.primary}, ${({ theme }) => theme.colors.secondary});
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-  }
-  
-  p {
-    color: ${({ theme }) => theme.colors.onBackground};
-    opacity: 0.8;
-  }
-`;
-
-const StepIndicator = styled.div`
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: ${({ theme }) => theme.spacing.lg};
-  position: relative;
-  
-  &::before {
-    content: '';
-    position: absolute;
-    top: 50%;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background-color: ${({ theme }) => theme.colors.surfaceLight};
-    transform: translateY(-50%);
-    z-index: 0;
-  }
-`;
-
-const Step = styled.div<{ active: boolean; completed: boolean }>`
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background-color: ${({ theme, active, completed }) => 
-    completed ? theme.colors.success : 
-    active ? theme.colors.primary : 
-    theme.colors.surfaceLight};
-  color: ${({ theme, active, completed }) => 
-    completed || active ? theme.colors.onPrimary : 
-    theme.colors.onSurface};
-  font-weight: bold;
-  z-index: 1;
-  transition: all 0.3s ease;
-  position: relative;
-  
-  &::after {
-    content: '${({ active, completed }) => completed ? '✓' : ''}';
-    position: absolute;
-  }
-`;
-
-const StepLabel = styled.div<{ active: boolean }>`
-  position: absolute;
-  top: 45px;
-  transform: translateX(-50%);
-  font-size: ${({ theme }) => theme.fontSizes.xs};
-  color: ${({ theme, active }) => active ? theme.colors.primary : theme.colors.onBackground};
-  opacity: ${({ active }) => active ? 1 : 0.6};
-  white-space: nowrap;
-  text-align: center;
-  width: 100px;
-`;
-
-const Card = styled.div`
-  background-color: ${({ theme }) => theme.colors.surface};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => theme.spacing.lg};
-  box-shadow: ${({ theme }) => theme.shadows.md};
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-`;
-
-const MethodSelector = styled.div`
-  display: flex;
-  gap: ${({ theme }) => theme.spacing.md};
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-`;
-
-const MethodButton = styled.button<{ selected: boolean }>`
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  flex: 1;
-  padding: ${({ theme }) => theme.spacing.lg};
-  background-color: ${({ theme, selected }) => selected ? theme.colors.primary + '33' : theme.colors.surfaceLight};
-  border: 2px solid ${({ theme, selected }) => selected ? theme.colors.primary : 'transparent'};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  cursor: pointer;
-  transition: all 0.2s ease;
-  
-  &:hover {
-    background-color: ${({ theme, selected }) => selected ? theme.colors.primary + '33' : theme.colors.surfaceLight + '99'};
-  }
-  
-  .icon {
-    font-size: 2rem;
-    margin-bottom: ${({ theme }) => theme.spacing.sm};
-    color: ${({ theme, selected }) => selected ? theme.colors.primary : theme.colors.onBackground};
-  }
-  
-  .label {
-    font-weight: ${({ selected }) => selected ? 'bold' : 'normal'};
-    color: ${({ theme, selected }) => selected ? theme.colors.primary : theme.colors.onBackground};
-  }
-`;
-
-const FormGroup = styled.div`
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-`;
-
-const Label = styled.label`
-  display: block;
-  margin-bottom: ${({ theme }) => theme.spacing.xs};
-  color: ${({ theme }) => theme.colors.onBackground};
-  font-size: ${({ theme }) => theme.fontSizes.sm};
-`;
-
-const Input = styled.input`
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  color: ${({ theme }) => theme.colors.onSurface};
-  border: 1px solid ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => `${theme.spacing.sm} ${theme.spacing.md}`};
-  font-size: ${({ theme }) => theme.fontSizes.md};
-  width: 100%;
-  transition: ${({ theme }) => theme.transitions.default};
-  
-  &:focus {
-    outline: none;
-    border-color: ${({ theme }) => theme.colors.primary};
-  }
-`;
-
-const TextArea = styled.textarea`
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  color: ${({ theme }) => theme.colors.onSurface};
-  border: 1px solid ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => `${theme.spacing.sm} ${theme.spacing.md}`};
-  font-size: ${({ theme }) => theme.fontSizes.md};
-  width: 100%;
-  min-height: 120px;
-  resize: vertical;
-  transition: ${({ theme }) => theme.transitions.default};
-  
-  &:focus {
-    outline: none;
-    border-color: ${({ theme }) => theme.colors.primary};
-  }
-`;
-
-const FileInput = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: ${({ theme }) => theme.spacing.sm};
-`;
-
-const FilePlaceholder = styled.div`
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  border: 2px dashed ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => theme.spacing.lg};
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  
-  &:hover {
-    border-color: ${({ theme }) => theme.colors.primary};
-  }
-  
-  .icon {
-    font-size: 2rem;
-    margin-bottom: ${({ theme }) => theme.spacing.sm};
-    color: ${({ theme }) => theme.colors.onBackground};
-    opacity: 0.6;
-  }
-  
-  .text {
-    text-align: center;
-  }
-`;
-
-const SelectedFile = styled.div`
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => theme.spacing.md};
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  
-  .file-info {
-    display: flex;
-    align-items: center;
-    gap: ${({ theme }) => theme.spacing.sm};
-  }
-  
-  .file-icon {
-    color: ${({ theme }) => theme.colors.primary};
-  }
-  
-  .file-name {
-    font-weight: bold;
-  }
-  
-  .remove-button {
-    color: ${({ theme }) => theme.colors.error};
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: ${({ theme }) => theme.spacing.xs};
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    
-    &:hover {
-      background-color: ${({ theme }) => theme.colors.error + '33'};
-    }
-  }
-`;
-
-const SeedWordContainer = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: ${({ theme }) => theme.spacing.xs};
-  margin-top: ${({ theme }) => theme.spacing.sm};
-`;
-
-const SeedWord = styled.div<{ isValid: boolean }>`
-  background-color: ${({ theme, isValid }) => isValid ? theme.colors.surfaceLight : theme.colors.error + '33'};
-  border-radius: ${({ theme }) => theme.borderRadius.sm};
-  padding: ${({ theme }) => `${theme.spacing.xs} ${theme.spacing.sm}`};
-  font-size: ${({ theme }) => theme.fontSizes.sm};
-  display: inline-block;
-`;
-
-const HelpText = styled.p`
-  font-size: ${({ theme }) => theme.fontSizes.sm};
-  color: ${({ theme }) => theme.colors.onBackground};
-  opacity: 0.7;
-  margin-top: ${({ theme }) => theme.spacing.xs};
-`;
-
-const ErrorText = styled.p`
-  font-size: ${({ theme }) => theme.fontSizes.sm};
-  color: ${({ theme }) => theme.colors.error};
-  margin-top: ${({ theme }) => theme.spacing.xs};
-`;
-
-const ButtonContainer = styled.div`
-  display: flex;
-  justify-content: space-between;
-  margin-top: ${({ theme }) => theme.spacing.lg};
-`;
-
-const Button = styled.button<{ variant?: 'primary' | 'secondary' | 'error' }>`
-  background-color: ${({ theme, variant }) => 
-    variant === 'secondary' ? theme.colors.surfaceLight : 
-    variant === 'error' ? theme.colors.error : 
-    theme.colors.primary};
-  color: ${({ theme, variant }) => 
-    variant === 'secondary' ? theme.colors.onSurface : 
-    variant === 'error' ? theme.colors.onError : 
-    theme.colors.onPrimary};
-  border: none;
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => `${theme.spacing.sm} ${theme.spacing.lg}`};
-  font-size: ${({ theme }) => theme.fontSizes.md};
-  font-weight: bold;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  display: flex;
-  align-items: center;
-  gap: ${({ theme }) => theme.spacing.sm};
-  
-  &:hover {
-    opacity: 0.9;
-  }
-  
-  &:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-`;
-
-const SuccessAnimation = styled.div`
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: ${({ theme }) => theme.spacing.xl};
-  
-  .check-circle {
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
-    background-color: ${({ theme }) => theme.colors.success};
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: ${({ theme }) => theme.spacing.lg};
-    animation: scale-in 0.5s ease-out;
-  }
-  
-  .check-mark {
-    color: white;
-    font-size: 3rem;
-  }
-  
-  h3 {
-    margin-bottom: ${({ theme }) => theme.spacing.md};
-  }
-  
-  @keyframes scale-in {
-    0% {
-      transform: scale(0);
-    }
-    70% {
-      transform: scale(1.1);
-    }
-    100% {
-      transform: scale(1);
-    }
-  }
-`;
-
-const InfoBox = styled.div`
-  background-color: ${({ theme }) => theme.colors.info + '33'};
-  border-left: 4px solid ${({ theme }) => theme.colors.info};
-  padding: ${({ theme }) => theme.spacing.md};
-  border-radius: ${({ theme }) => theme.borderRadius.sm};
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-  
-  .title {
-    color: ${({ theme }) => theme.colors.info};
-    font-weight: bold;
-    margin-bottom: ${({ theme }) => theme.spacing.xs};
-  }
-  
-  .content {
-    font-size: ${({ theme }) => theme.fontSizes.sm};
-  }
-`;
-
-// Types
 interface WalletImportProps {
-  onComplete: (walletInfo: { name: string; pubkey: string }) => void;
-  onCancel: () => void;
-  pin: string;
+  onComplete: (success: boolean) => void;
 }
 
-// Main component
-const WalletImport: React.FC<WalletImportProps> = ({ onComplete, onCancel, pin }) => {
-  // State
-  const [currentStep, setCurrentStep] = useState(1);
-  const [importMethod, setImportMethod] = useState<'file' | 'seed' | null>(null);
-  const [walletName, setWalletName] = useState('');
+const WalletImport: React.FC<WalletImportProps> = ({ onComplete }) => {
+  // State management
+  const [currentStep, setCurrentStep] = useState<Step>('method');
+  const [importMethod, setImportMethod] = useState<ImportMethod>('solflare');
   const [seedPhrase, setSeedPhrase] = useState('');
-  const [passphrase, setPassphrase] = useState('');
-  const [selectedFile, setSelectedFile] = useState<{ path: string; name: string } | null>(null);
-  const [seedWords, setSeedWords] = useState<{ word: string; isValid: boolean }[]>([]);
-  const [error, setError] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [isComplete, setIsComplete] = useState(false);
-  const [importedWallet, setImportedWallet] = useState<{ name: string; pubkey: string } | null>(null);
+  const [privateKey, setPrivateKey] = useState('');
+  const [solflareFile, setSolflareFile] = useState<string | null>(null);
+  const [solflarePassword, setSolflarePassword] = useState('');
+  const [pin, setPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [walletName, setWalletName] = useState('My Wallet');
 
-  // BIP39 word list (simplified version - in a real app, we'd use a complete list)
-  const bip39WordList = [
-    "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd", "abuse",
-    "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire", "across", "act",
-    "action", "actor", "actress", "actual", "adapt", "add", "addict", "address", "adjust", "admit",
-    "adult", "advance", "advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent",
-    "agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album", "alcohol", "alert",
-    "alien", "all", "alley", "allow", "almost", "alone", "alpha", "already", "also", "alter",
-    "always", "amateur", "amazing", "among", "amount", "amused", "analyst", "anchor", "ancient", "anger",
-    "angle", "angry", "animal", "ankle", "announce", "annual", "another", "answer", "antenna", "antique",
-    "anxiety", "any", "apart", "apology", "appear", "apple", "approve", "april", "arch", "arctic",
-    "area", "arena", "argue", "arm", "armed", "armor", "army", "around", "arrange", "arrest",
-    "arrive", "arrow", "art", "artefact", "artist", "artwork", "ask", "aspect", "assault", "asset",
-    "assist", "assume", "asthma", "athlete", "atom", "attack", "attend", "attitude", "attract", "auction",
-    "audit", "august", "aunt", "author", "auto", "autumn", "average", "avocado", "avoid", "awake",
-    "aware", "away", "awesome", "awful", "awkward", "axis", "baby", "bachelor", "bacon", "badge",
-    "bag", "balance", "balcony", "ball", "bamboo", "banana", "banner", "bar", "barely", "bargain",
-    "barrel", "base", "basic", "basket", "battle", "beach", "bean", "beauty", "because", "become",
-    "beef", "before", "begin", "behave", "behind", "believe", "below", "belt", "bench", "benefit"
-    // ... and many more words in a real implementation
-  ];
-
-  // Effect to validate seed phrase
-  useEffect(() => {
-    if (seedPhrase) {
-      const words = seedPhrase.trim().toLowerCase().split(/\s+/);
-      const validatedWords = words.map(word => ({
-        word,
-        isValid: bip39WordList.includes(word)
-      }));
-      setSeedWords(validatedWords);
-    } else {
-      setSeedWords([]);
+  // Step titles and descriptions
+  const stepInfo = {
+    method: {
+      title: 'Choose Import Method',
+      description: 'Select how you want to import your wallet'
+    },
+    solflare: {
+      title: 'Import Solflare Wallet',
+      description: 'Upload your Solflare JSON file and enter password'
+    },
+    seedphrase: {
+      title: 'Import Seed Phrase',
+      description: 'Enter your 12 or 24-word recovery phrase'
+    },
+    keypair: {
+      title: 'Import Private Key',
+      description: 'Enter your wallet private key'
+    },
+    pin: {
+      title: 'Create PIN',
+      description: 'Create a 4-digit PIN to secure your wallet'
+    },
+    complete: {
+      title: 'Wallet Imported',
+      description: 'Your wallet has been successfully imported'
     }
-  }, [seedPhrase]);
+  };
 
-  // Handle file selection
+  // Handle method selection
+  const handleMethodSelect = (method: ImportMethod) => {
+    setImportMethod(method);
+    setCurrentStep(method);
+    setError(null);
+  };
+
+  // Handle Solflare file selection
   const handleFileSelect = async () => {
     try {
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: 'Solana Keypair', extensions: ['json'] }]
+      const selected = await dialog.open({
+        filters: [{
+          name: 'JSON',
+          extensions: ['json']
+        }],
+        multiple: false
       });
-      
-      if (selected && typeof selected === 'string') {
-        // Get just the filename from the path
-        const name = selected.split('/').pop() || selected.split('\\').pop() || selected;
-        
-        setSelectedFile({
-          path: selected,
-          name
-        });
-        
-        // Auto-generate wallet name from filename (without extension)
-        if (!walletName) {
-          const nameWithoutExt = name.replace(/\.json$/, '');
-          setWalletName(nameWithoutExt);
-        }
-        
-        setError('');
+
+      if (selected && !Array.isArray(selected)) {
+        setSolflareFile(selected as string);
+        setError(null);
       }
     } catch (err) {
-      console.error('Error selecting file:', err);
+      console.error('File selection error:', err);
       setError('Failed to select file. Please try again.');
     }
   };
 
+  // Validate seed phrase
+  const validateSeedPhrase = (phrase: string): boolean => {
+    const words = phrase.trim().split(/\s+/);
+    return words.length === 12 || words.length === 24;
+  };
+
+  // Validate private key
+  const validatePrivateKey = (key: string): boolean => {
+    // Basic validation - should be 64 hex characters
+    return /^[0-9a-fA-F]{64}$/.test(key.trim());
+  };
+
+  // Validate PIN
+  const validatePin = (): boolean => {
+    return pin.length === 4 && pin === confirmPin;
+  };
+
   // Handle next step
-  const handleNextStep = () => {
-    // Validate current step
-    if (currentStep === 1) {
-      if (!importMethod) {
-        setError('Please select an import method');
+  const handleNext = () => {
+    setError(null);
+
+    // Validation based on current step
+    if (currentStep === 'solflare') {
+      if (!solflareFile) {
+        setError('Please select a Solflare JSON file');
         return;
       }
-      setError('');
-    } else if (currentStep === 2) {
-      if (!walletName.trim()) {
-        setError('Please enter a wallet name');
+      if (!solflarePassword) {
+        setError('Please enter your Solflare wallet password');
         return;
       }
-      setError('');
-    } else if (currentStep === 3) {
-      if (importMethod === 'file' && !selectedFile) {
-        setError('Please select a keypair file');
+      setCurrentStep('pin');
+    } 
+    else if (currentStep === 'seedphrase') {
+      if (!validateSeedPhrase(seedPhrase)) {
+        setError('Please enter a valid 12 or 24-word seed phrase');
         return;
-      } else if (importMethod === 'seed') {
-        const words = seedWords.length;
-        if (words !== 12 && words !== 24) {
-          setError('Seed phrase must be 12 or 24 words');
-          return;
-        }
-        
-        const invalidWords = seedWords.filter(w => !w.isValid);
-        if (invalidWords.length > 0) {
-          setError(`Invalid seed words detected: ${invalidWords.map(w => w.word).join(', ')}`);
-          return;
-        }
       }
-      setError('');
+      setCurrentStep('pin');
+    } 
+    else if (currentStep === 'keypair') {
+      if (!validatePrivateKey(privateKey)) {
+        setError('Please enter a valid private key (64 hex characters)');
+        return;
+      }
+      setCurrentStep('pin');
+    } 
+    else if (currentStep === 'pin') {
+      if (!validatePin()) {
+        setError('Please enter a valid 4-digit PIN and ensure it matches the confirmation');
+        return;
+      }
+      handleImport();
     }
-    
-    // Move to next step
-    setCurrentStep(prev => prev + 1);
   };
 
-  // Handle previous step
-  const handlePrevStep = () => {
-    setCurrentStep(prev => prev - 1);
-    setError('');
+  // Handle back
+  const handleBack = () => {
+    if (currentStep === 'solflare' || currentStep === 'seedphrase' || currentStep === 'keypair') {
+      setCurrentStep('method');
+    } else if (currentStep === 'pin') {
+      setCurrentStep(importMethod);
+    }
+    setError(null);
   };
 
-  // Handle import
+  // Handle wallet import
   const handleImport = async () => {
-    setIsLoading(true);
-    setError('');
-    
+    setLoading(true);
+    setError(null);
+
     try {
-      let result;
-      
-      if (importMethod === 'file' && selectedFile) {
-        // Read file content
-        const fileContent = await readTextFile(selectedFile.path);
-        
-        // Import from file
-        result = await invoke('import_from_file', {
-          name: walletName,
-          filePath: selectedFile.path,
-          pin
+      let result = false;
+
+      if (importMethod === 'solflare') {
+        result = await invoke('import_solflare_wallet', {
+          filePath: solflareFile,
+          password: solflarePassword,
+          pin,
+          name: walletName
         });
-      } else if (importMethod === 'seed') {
-        // Import from seed phrase
-        result = await invoke('import_from_seed_phrase', {
-          name: walletName,
+      } else if (importMethod === 'seedphrase') {
+        result = await invoke('import_seed_phrase', {
           seedPhrase,
-          passphrase,
-          pin
+          pin,
+          name: walletName
+        });
+      } else if (importMethod === 'keypair') {
+        result = await invoke('import_private_key', {
+          privateKey,
+          pin,
+          name: walletName
         });
       }
-      
-      // Set imported wallet info
+
       if (result) {
-        setImportedWallet(result as { name: string; pubkey: string });
-        setIsComplete(true);
+        setCurrentStep('complete');
+      } else {
+        setError('Failed to import wallet. Please check your inputs and try again.');
       }
     } catch (err) {
-      console.error('Error importing wallet:', err);
-      setError(`Failed to import wallet: ${err}`);
+      console.error('Wallet import error:', err);
+      setError(`Import failed: ${err}`);
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
   // Handle completion
   const handleComplete = () => {
-    if (importedWallet) {
-      onComplete(importedWallet);
-    }
+    onComplete(currentStep === 'complete');
   };
 
-  // Render step content
+  // Render method selection step
+  const renderMethodStep = () => (
+    <div className="method-selection">
+      <div 
+        className={`method-card ${importMethod === 'solflare' ? 'selected' : ''}`}
+        onClick={() => handleMethodSelect('solflare')}
+      >
+        <div className="method-icon solflare-icon"></div>
+        <h3>Solflare Wallet</h3>
+        <p>Import using Solflare JSON file</p>
+      </div>
+      
+      <div 
+        className={`method-card ${importMethod === 'seedphrase' ? 'selected' : ''}`}
+        onClick={() => handleMethodSelect('seedphrase')}
+      >
+        <div className="method-icon seed-icon"></div>
+        <h3>Seed Phrase</h3>
+        <p>Import using 12 or 24-word recovery phrase</p>
+      </div>
+      
+      <div 
+        className={`method-card ${importMethod === 'keypair' ? 'selected' : ''}`}
+        onClick={() => handleMethodSelect('keypair')}
+      >
+        <div className="method-icon key-icon"></div>
+        <h3>Private Key</h3>
+        <p>Import using wallet private key</p>
+      </div>
+    </div>
+  );
+
+  // Render Solflare import step
+  const renderSolflareStep = () => (
+    <div className="solflare-import">
+      <div className="file-upload">
+        <button 
+          className="file-select-button"
+          onClick={handleFileSelect}
+        >
+          {solflareFile ? 'Change File' : 'Select Solflare JSON File'}
+        </button>
+        
+        {solflareFile && (
+          <div className="selected-file">
+            Selected: {solflareFile.split('/').pop()}
+          </div>
+        )}
+      </div>
+      
+      <div className="form-group">
+        <label>Wallet Password</label>
+        <input 
+          type="password"
+          value={solflarePassword}
+          onChange={(e) => setSolflarePassword(e.target.value)}
+          placeholder="Enter your Solflare wallet password"
+        />
+      </div>
+      
+      <div className="form-group">
+        <label>Wallet Name (Optional)</label>
+        <input 
+          type="text"
+          value={walletName}
+          onChange={(e) => setWalletName(e.target.value)}
+          placeholder="My Wallet"
+        />
+      </div>
+    </div>
+  );
+
+  // Render seed phrase import step
+  const renderSeedPhraseStep = () => (
+    <div className="seedphrase-import">
+      <div className="form-group">
+        <label>Seed Phrase</label>
+        <textarea
+          value={seedPhrase}
+          onChange={(e) => setSeedPhrase(e.target.value)}
+          placeholder="Enter your 12 or 24-word recovery phrase separated by spaces"
+          rows={4}
+          className="seed-textarea"
+        />
+      </div>
+      
+      <div className="seed-info">
+        <div className="info-icon">ℹ️</div>
+        <p>
+          Your seed phrase is never sent to any server and is only used locally to 
+          generate your wallet. It will be encrypted and stored securely.
+        </p>
+      </div>
+      
+      <div className="form-group">
+        <label>Wallet Name (Optional)</label>
+        <input 
+          type="text"
+          value={walletName}
+          onChange={(e) => setWalletName(e.target.value)}
+          placeholder="My Wallet"
+        />
+      </div>
+    </div>
+  );
+
+  // Render private key import step
+  const renderKeypairStep = () => (
+    <div className="keypair-import">
+      <div className="form-group">
+        <label>Private Key</label>
+        <input 
+          type="password"
+          value={privateKey}
+          onChange={(e) => setPrivateKey(e.target.value)}
+          placeholder="Enter your private key (64 hex characters)"
+        />
+      </div>
+      
+      <div className="key-info">
+        <div className="info-icon">ℹ️</div>
+        <p>
+          Your private key is never sent to any server and is only used locally.
+          It will be encrypted and stored securely.
+        </p>
+      </div>
+      
+      <div className="form-group">
+        <label>Wallet Name (Optional)</label>
+        <input 
+          type="text"
+          value={walletName}
+          onChange={(e) => setWalletName(e.target.value)}
+          placeholder="My Wallet"
+        />
+      </div>
+    </div>
+  );
+
+  // Render PIN creation step
+  const renderPinStep = () => (
+    <div className="pin-creation">
+      <div className="form-group">
+        <label>Create PIN (4 digits)</label>
+        <input 
+          type="password"
+          maxLength={4}
+          value={pin}
+          onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ''))}
+          placeholder="Enter 4-digit PIN"
+        />
+      </div>
+      
+      <div className="form-group">
+        <label>Confirm PIN</label>
+        <input 
+          type="password"
+          maxLength={4}
+          value={confirmPin}
+          onChange={(e) => setConfirmPin(e.target.value.replace(/[^0-9]/g, ''))}
+          placeholder="Confirm 4-digit PIN"
+        />
+      </div>
+      
+      <div className="pin-info">
+        <div className="info-icon">ℹ️</div>
+        <p>
+          This PIN will be used to encrypt your wallet and will be required each time
+          you open the application. Please remember it as it cannot be recovered.
+        </p>
+      </div>
+    </div>
+  );
+
+  // Render completion step
+  const renderCompleteStep = () => (
+    <div className="import-complete">
+      <div className="success-icon">✓</div>
+      <h3>Wallet Successfully Imported!</h3>
+      <p>You can now start trading with your wallet.</p>
+    </div>
+  );
+
+  // Render current step content
   const renderStepContent = () => {
     switch (currentStep) {
-      case 1:
-        return (
-          <Card>
-            <h3>Select Import Method</h3>
-            <p>Choose how you want to import your Solana wallet:</p>
-            
-            <MethodSelector>
-              <MethodButton 
-                selected={importMethod === 'file'} 
-                onClick={() => setImportMethod('file')}
-              >
-                <div className="icon">📄</div>
-                <div className="label">Keypair File</div>
-                <div style={{ fontSize: '0.8rem', opacity: 0.7 }}>Solflare, Phantom</div>
-              </MethodButton>
-              
-              <MethodButton 
-                selected={importMethod === 'seed'} 
-                onClick={() => setImportMethod('seed')}
-              >
-                <div className="icon">🔑</div>
-                <div className="label">Seed Phrase</div>
-                <div style={{ fontSize: '0.8rem', opacity: 0.7 }}>12 or 24 words</div>
-              </MethodButton>
-            </MethodSelector>
-            
-            {importMethod === 'file' && (
-              <InfoBox>
-                <div className="title">About Keypair Files</div>
-                <div className="content">
-                  <p>A keypair file contains your wallet's private key in encrypted form. You can export this file from wallets like Solflare or Phantom.</p>
-                  <p>To export from Solflare: Settings → Security → Export Keypair</p>
-                </div>
-              </InfoBox>
-            )}
-            
-            {importMethod === 'seed' && (
-              <InfoBox>
-                <div className="title">About Seed Phrases</div>
-                <div className="content">
-                  <p>A seed phrase (also called recovery phrase or mnemonic) is a list of 12 or 24 words that can recreate your wallet.</p>
-                  <p>⚠️ Never share your seed phrase with anyone or enter it on untrusted websites!</p>
-                </div>
-              </InfoBox>
-            )}
-          </Card>
-        );
-      
-      case 2:
-        return (
-          <Card>
-            <h3>Name Your Wallet</h3>
-            <p>Choose a name for this wallet to easily identify it in the app:</p>
-            
-            <FormGroup>
-              <Label htmlFor="walletName">Wallet Name</Label>
-              <Input
-                id="walletName"
-                type="text"
-                value={walletName}
-                onChange={(e) => setWalletName(e.target.value)}
-                placeholder="e.g., My Trading Wallet"
-                autoFocus
-              />
-              <HelpText>Choose a memorable name like "Trading Wallet" or "Arbitrage Bot"</HelpText>
-            </FormGroup>
-          </Card>
-        );
-      
-      case 3:
-        return (
-          <Card>
-            <h3>{importMethod === 'file' ? 'Select Keypair File' : 'Enter Seed Phrase'}</h3>
-            
-            {importMethod === 'file' && (
-              <FileInput>
-                {!selectedFile ? (
-                  <FilePlaceholder onClick={handleFileSelect}>
-                    <div className="icon">📁</div>
-                    <div className="text">
-                      <p>Click to select your Solana keypair file</p>
-                      <p style={{ fontSize: '0.8rem', opacity: 0.7 }}>Supports .json files exported from Solflare or Phantom</p>
-                    </div>
-                  </FilePlaceholder>
-                ) : (
-                  <SelectedFile>
-                    <div className="file-info">
-                      <div className="file-icon">📄</div>
-                      <div className="file-name">{selectedFile.name}</div>
-                    </div>
-                    <button 
-                      className="remove-button" 
-                      onClick={() => setSelectedFile(null)}
-                      aria-label="Remove file"
-                    >
-                      ✕
-                    </button>
-                  </SelectedFile>
-                )}
-                <Button variant="secondary" onClick={handleFileSelect}>
-                  Browse Files
-                </Button>
-              </FileInput>
-            )}
-            
-            {importMethod === 'seed' && (
-              <>
-                <FormGroup>
-                  <Label htmlFor="seedPhrase">Seed Phrase (12 or 24 words)</Label>
-                  <TextArea
-                    id="seedPhrase"
-                    value={seedPhrase}
-                    onChange={(e) => setSeedPhrase(e.target.value)}
-                    placeholder="Enter your seed phrase words separated by spaces"
-                    autoFocus
-                  />
-                  <HelpText>Enter your 12 or 24 words separated by spaces</HelpText>
-                  
-                  {seedWords.length > 0 && (
-                    <SeedWordContainer>
-                      {seedWords.map((word, index) => (
-                        <SeedWord key={index} isValid={word.isValid}>
-                          {word.word}
-                        </SeedWord>
-                      ))}
-                    </SeedWordContainer>
-                  )}
-                </FormGroup>
-                
-                <FormGroup>
-                  <Label htmlFor="passphrase">Passphrase (Optional)</Label>
-                  <Input
-                    id="passphrase"
-                    type="password"
-                    value={passphrase}
-                    onChange={(e) => setPassphrase(e.target.value)}
-                    placeholder="Enter passphrase if you have one"
-                  />
-                  <HelpText>Only enter if you created your wallet with an additional passphrase</HelpText>
-                </FormGroup>
-              </>
-            )}
-          </Card>
-        );
-      
-      case 4:
-        return (
-          <Card>
-            <h3>Confirm Import</h3>
-            <p>Please review your wallet import details:</p>
-            
-            <div style={{ margin: '20px 0' }}>
-              <p><strong>Import Method:</strong> {importMethod === 'file' ? 'Keypair File' : 'Seed Phrase'}</p>
-              <p><strong>Wallet Name:</strong> {walletName}</p>
-              {importMethod === 'file' && selectedFile && (
-                <p><strong>File:</strong> {selectedFile.name}</p>
-              )}
-              {importMethod === 'seed' && (
-                <p><strong>Seed Phrase:</strong> {seedWords.length} words {passphrase ? '(with passphrase)' : ''}</p>
-              )}
-            </div>
-            
-            <InfoBox>
-              <div className="title">Security Note</div>
-              <div className="content">
-                <p>Your wallet will be encrypted with your PIN and stored securely on your device.</p>
-                <p>If you're importing with a seed phrase, it will only be used once and never stored.</p>
-              </div>
-            </InfoBox>
-          </Card>
-        );
-      
-      case 5:
-        if (isComplete && importedWallet) {
-          return (
-            <Card>
-              <SuccessAnimation>
-                <div className="check-circle">
-                  <div className="check-mark">✓</div>
-                </div>
-                <h3>Wallet Imported Successfully!</h3>
-                <p>Your wallet has been securely imported and encrypted.</p>
-                <p style={{ marginTop: '10px' }}><strong>Wallet Name:</strong> {importedWallet.name}</p>
-                <p><strong>Public Key:</strong> {importedWallet.pubkey}</p>
-                <Button onClick={handleComplete} style={{ marginTop: '20px' }}>
-                  Start Trading
-                </Button>
-              </SuccessAnimation>
-            </Card>
-          );
-        }
-        
-        return (
-          <Card>
-            <h3>Importing Wallet</h3>
-            <p>Please wait while we import and encrypt your wallet...</p>
-            
-            <div style={{ margin: '30px 0', textAlign: 'center' }}>
-              {/* Simple loading animation */}
-              <div style={{ 
-                display: 'inline-block',
-                width: '50px',
-                height: '50px',
-                border: '5px solid rgba(187, 134, 252, 0.3)',
-                borderRadius: '50%',
-                borderTop: '5px solid #BB86FC',
-                animation: 'spin 1s linear infinite'
-              }} />
-              <style>
-                {`
-                  @keyframes spin {
-                    0% { transform: rotate(0deg); }
-                    100% { transform: rotate(360deg); }
-                  }
-                `}
-              </style>
-            </div>
-          </Card>
-        );
-      
+      case 'method':
+        return renderMethodStep();
+      case 'solflare':
+        return renderSolflareStep();
+      case 'seedphrase':
+        return renderSeedPhraseStep();
+      case 'keypair':
+        return renderKeypairStep();
+      case 'pin':
+        return renderPinStep();
+      case 'complete':
+        return renderCompleteStep();
       default:
         return null;
     }
   };
 
-  // Render step indicators
-  const renderStepIndicators = () => {
-    const steps = [
-      { number: 1, label: 'Method' },
-      { number: 2, label: 'Name' },
-      { number: 3, label: 'Import' },
-      { number: 4, label: 'Confirm' },
-      { number: 5, label: 'Complete' }
-    ];
-    
-    return (
-      <StepIndicator>
-        {steps.map((step) => (
-          <div key={step.number} style={{ position: 'relative' }}>
-            <Step 
-              active={currentStep === step.number} 
-              completed={currentStep > step.number}
-            >
-              {currentStep > step.number ? '' : step.number}
-            </Step>
-            <StepLabel active={currentStep === step.number}>
-              {step.label}
-            </StepLabel>
-          </div>
-        ))}
-      </StepIndicator>
-    );
-  };
-
-  // Render buttons
-  const renderButtons = () => {
-    // On the last step, we either show the loading state or no buttons (success)
-    if (currentStep === 5) {
-      if (!isComplete) {
-        return null; // No buttons during loading
-      }
-      return null; // No buttons after success (we have a button in the success content)
-    }
-    
-    return (
-      <ButtonContainer>
-        {currentStep > 1 ? (
-          <Button variant="secondary" onClick={handlePrevStep}>
-            Back
-          </Button>
-        ) : (
-          <Button variant="secondary" onClick={onCancel}>
-            Cancel
-          </Button>
-        )}
-        
-        {currentStep === 4 ? (
-          <Button onClick={handleImport} disabled={isLoading}>
-            {isLoading ? 'Importing...' : 'Import Wallet'}
-          </Button>
-        ) : (
-          <Button onClick={handleNextStep}>
-            Next
-          </Button>
-        )}
-      </ButtonContainer>
-    );
-  };
-
   return (
-    <WizardContainer>
-      <WizardHeader>
-        <h2>Import Your Solana Wallet</h2>
-        <p>Follow these simple steps to securely import your wallet</p>
-      </WizardHeader>
-      
-      {renderStepIndicators()}
-      
-      {renderStepContent()}
-      
-      {error && <ErrorText>{error}</ErrorText>}
-      
-      {renderButtons()}
-    </WizardContainer>
+    <div className="wallet-import-overlay">
+      <div className="wallet-import-modal">
+        <div className="modal-header">
+          <h2>{stepInfo[currentStep].title}</h2>
+          <button 
+            className="close-button"
+            onClick={() => onComplete(false)}
+          >
+            ✕
+          </button>
+        </div>
+        
+        <div className="modal-body">
+          <p className="step-description">{stepInfo[currentStep].description}</p>
+          
+          {renderStepContent()}
+          
+          {error && (
+            <div className="error-message">
+              {error}
+            </div>
+          )}
+        </div>
+        
+        <div className="modal-footer">
+          {currentStep !== 'method' && currentStep !== 'complete' && (
+            <button 
+              className="back-button"
+              onClick={handleBack}
+              disabled={loading}
+            >
+              Back
+            </button>
+          )}
+          
+          {currentStep !== 'complete' ? (
+            <button 
+              className="next-button"
+              onClick={currentStep === 'method' ? () => handleMethodSelect(importMethod) : handleNext}
+              disabled={loading}
+            >
+              {currentStep === 'pin' ? 'Import Wallet' : 'Next'}
+              {loading && <span className="loading-spinner"></span>}
+            </button>
+          ) : (
+            <button 
+              className="complete-button"
+              onClick={handleComplete}
+            >
+              Start Trading
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 };
 

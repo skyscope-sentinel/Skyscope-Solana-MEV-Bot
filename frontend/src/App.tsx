@@ -1,1104 +1,504 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
-import styled, { ThemeProvider, createGlobalStyle } from 'styled-components';
+import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
 import { Line } from 'react-chartjs-2';
-import QRCode from 'react-qr-code';
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Title,
-  Tooltip,
-  Legend,
-} from 'chart.js';
+import WalletImport from './components/WalletImport';
+import './App.css';
 
 // Register Chart.js components
-ChartJS.register(
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Title,
-  Tooltip,
-  Legend
-);
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
-// Theme definition
-const theme = {
-  colors: {
-    background: '#121212',
-    surface: '#1E1E1E',
-    surfaceLight: '#2D2D2D',
-    primary: '#BB86FC',
-    primaryVariant: '#3700B3',
-    secondary: '#03DAC6',
-    error: '#CF6679',
-    onBackground: '#FFFFFF',
-    onSurface: '#FFFFFF',
-    onPrimary: '#000000',
-    onSecondary: '#000000',
-    onError: '#000000',
-    success: '#4CAF50',
-    warning: '#FFC107',
-    info: '#2196F3',
-  },
-  spacing: {
-    xs: '4px',
-    sm: '8px',
-    md: '16px',
-    lg: '24px',
-    xl: '32px',
-  },
-  borderRadius: {
-    sm: '4px',
-    md: '8px',
-    lg: '16px',
-    xl: '24px',
-    circle: '50%',
-  },
-  shadows: {
-    sm: '0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24)',
-    md: '0 3px 6px rgba(0,0,0,0.16), 0 3px 6px rgba(0,0,0,0.23)',
-    lg: '0 10px 20px rgba(0,0,0,0.19), 0 6px 6px rgba(0,0,0,0.23)',
-  },
-  transitions: {
-    default: 'all 0.3s cubic-bezier(.25,.8,.25,1)',
-  },
-  fontSizes: {
-    xs: '12px',
-    sm: '14px',
-    md: '16px',
-    lg: '20px',
-    xl: '24px',
-    xxl: '32px',
-  },
-};
+// Mock data for development
+const mockBalanceHistory = Array.from({ length: 24 }, (_, i) => ({
+  time: `${i}:00`,
+  balance: 10 + Math.random() * 2,
+  profit: (Math.random() * 0.5).toFixed(4)
+}));
 
-// Global styles
-const GlobalStyle = createGlobalStyle`
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-  }
-
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-      'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-      sans-serif;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    background-color: ${({ theme }) => theme.colors.background};
-    color: ${({ theme }) => theme.colors.onBackground};
-    font-size: ${({ theme }) => theme.fontSizes.md};
-    line-height: 1.5;
-    overflow-x: hidden;
-  }
-
-  code, pre {
-    font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
-    background-color: ${({ theme }) => theme.colors.surfaceLight};
-    border-radius: ${({ theme }) => theme.borderRadius.sm};
-    padding: ${({ theme }) => theme.spacing.xs};
-  }
-
-  ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-
-  ::-webkit-scrollbar-track {
-    background: ${({ theme }) => theme.colors.surface};
-  }
-
-  ::-webkit-scrollbar-thumb {
-    background: ${({ theme }) => theme.colors.primaryVariant};
-    border-radius: ${({ theme }) => theme.borderRadius.md};
-  }
-
-  ::-webkit-scrollbar-thumb:hover {
-    background: ${({ theme }) => theme.colors.primary};
-  }
-`;
-
-// Styled Components
-const AppContainer = styled.div`
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  width: 100vw;
-  overflow: hidden;
-`;
-
-const Header = styled.header`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: ${({ theme }) => theme.spacing.md};
-  background-color: ${({ theme }) => theme.colors.surface};
-  border-bottom: 1px solid ${({ theme }) => theme.colors.surfaceLight};
-`;
-
-const Logo = styled.div`
-  display: flex;
-  align-items: center;
-  
-  h1 {
-    font-size: ${({ theme }) => theme.fontSizes.lg};
-    margin-left: ${({ theme }) => theme.spacing.md};
-  }
-`;
-
-const MainContent = styled.main`
-  flex: 1;
-  display: flex;
-  overflow: hidden;
-`;
-
-const Sidebar = styled.aside`
-  width: 250px;
-  background-color: ${({ theme }) => theme.colors.surface};
-  padding: ${({ theme }) => theme.spacing.md};
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid ${({ theme }) => theme.colors.surfaceLight};
-`;
-
-const Content = styled.section`
-  flex: 1;
-  padding: ${({ theme }) => theme.spacing.md};
-  overflow-y: auto;
-`;
-
-const Card = styled.div`
-  background-color: ${({ theme }) => theme.colors.surface};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => theme.spacing.md};
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-  box-shadow: ${({ theme }) => theme.shadows.sm};
-`;
-
-const Button = styled.button<{ variant?: 'primary' | 'secondary' | 'error' | 'success' | 'warning' | 'info' }>`
-  background-color: ${({ theme, variant }) => 
-    variant === 'secondary' ? theme.colors.secondary :
-    variant === 'error' ? theme.colors.error :
-    variant === 'success' ? theme.colors.success :
-    variant === 'warning' ? theme.colors.warning :
-    variant === 'info' ? theme.colors.info :
-    theme.colors.primary};
-  color: ${({ theme, variant }) => 
-    variant === 'secondary' ? theme.colors.onSecondary :
-    variant === 'error' ? theme.colors.onError :
-    variant === 'success' ? theme.colors.onBackground :
-    variant === 'warning' ? theme.colors.onBackground :
-    variant === 'info' ? theme.colors.onBackground :
-    theme.colors.onPrimary};
-  border: none;
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => `${theme.spacing.sm} ${theme.spacing.md}`};
-  font-size: ${({ theme }) => theme.fontSizes.md};
-  cursor: pointer;
-  transition: ${({ theme }) => theme.transitions.default};
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  
-  &:hover {
-    opacity: 0.9;
-    transform: translateY(-1px);
-  }
-  
-  &:active {
-    transform: translateY(1px);
-  }
-  
-  &:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-`;
-
-const Input = styled.input`
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  color: ${({ theme }) => theme.colors.onSurface};
-  border: 1px solid ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => `${theme.spacing.sm} ${theme.spacing.md}`};
-  font-size: ${({ theme }) => theme.fontSizes.md};
-  width: 100%;
-  transition: ${({ theme }) => theme.transitions.default};
-  
-  &:focus {
-    outline: none;
-    border-color: ${({ theme }) => theme.colors.primary};
-  }
-`;
-
-const PinInput = styled(Input)`
-  text-align: center;
-  letter-spacing: 8px;
-  font-size: ${({ theme }) => theme.fontSizes.lg};
-  font-weight: bold;
-  width: 160px;
-`;
-
-const FormGroup = styled.div`
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-`;
-
-const Label = styled.label`
-  display: block;
-  margin-bottom: ${({ theme }) => theme.spacing.xs};
-  color: ${({ theme }) => theme.colors.onBackground};
-  font-size: ${({ theme }) => theme.fontSizes.sm};
-`;
-
-const Flex = styled.div<{ direction?: 'row' | 'column', justify?: string, align?: string, gap?: string }>`
-  display: flex;
-  flex-direction: ${({ direction }) => direction || 'row'};
-  justify-content: ${({ justify }) => justify || 'flex-start'};
-  align-items: ${({ align }) => align || 'stretch'};
-  gap: ${({ gap, theme }) => gap || theme.spacing.md};
-`;
-
-const NavItem = styled.div<{ active?: boolean }>`
-  padding: ${({ theme }) => theme.spacing.md};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  cursor: pointer;
-  transition: ${({ theme }) => theme.transitions.default};
-  background-color: ${({ theme, active }) => active ? theme.colors.primaryVariant : 'transparent'};
-  
-  &:hover {
-    background-color: ${({ theme, active }) => active ? theme.colors.primaryVariant : theme.colors.surfaceLight};
-  }
-`;
-
-const ProgressBarContainer = styled.div`
-  width: 100%;
-  height: 8px;
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  overflow: hidden;
-  margin: ${({ theme }) => `${theme.spacing.md} 0`};
-`;
-
-const ProgressBarFill = styled.div<{ progress: number }>`
-  height: 100%;
-  width: ${({ progress }) => `${progress}%`};
-  background-color: ${({ theme }) => theme.colors.primary};
-  transition: width 0.3s ease;
-`;
-
-const Badge = styled.span<{ variant?: 'primary' | 'secondary' | 'error' | 'success' | 'warning' | 'info' }>`
-  background-color: ${({ theme, variant }) => 
-    variant === 'secondary' ? theme.colors.secondary :
-    variant === 'error' ? theme.colors.error :
-    variant === 'success' ? theme.colors.success :
-    variant === 'warning' ? theme.colors.warning :
-    variant === 'info' ? theme.colors.info :
-    theme.colors.primary};
-  color: ${({ theme, variant }) => 
-    variant === 'secondary' ? theme.colors.onSecondary :
-    variant === 'error' ? theme.colors.onError :
-    variant === 'success' ? theme.colors.onBackground :
-    variant === 'warning' ? theme.colors.onBackground :
-    variant === 'info' ? theme.colors.onBackground :
-    theme.colors.onPrimary};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => `${theme.spacing.xs} ${theme.spacing.sm}`};
-  font-size: ${({ theme }) => theme.fontSizes.xs};
-  font-weight: bold;
-  display: inline-block;
-`;
-
-const Stat = styled.div`
-  display: flex;
-  flex-direction: column;
-  padding: ${({ theme }) => theme.spacing.md};
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  
-  .label {
-    font-size: ${({ theme }) => theme.fontSizes.sm};
-    color: ${({ theme }) => theme.colors.onBackground};
-    opacity: 0.7;
-  }
-  
-  .value {
-    font-size: ${({ theme }) => theme.fontSizes.lg};
-    font-weight: bold;
-  }
-  
-  .subvalue {
-    font-size: ${({ theme }) => theme.fontSizes.xs};
-    opacity: 0.7;
-  }
-`;
-
-const CodeBlock = styled.pre`
-  background-color: ${({ theme }) => theme.colors.surfaceLight};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => theme.spacing.md};
-  overflow-x: auto;
-  font-family: 'Courier New', Courier, monospace;
-  font-size: ${({ theme }) => theme.fontSizes.sm};
-  margin: ${({ theme }) => theme.spacing.md} 0;
-`;
-
-const Modal = styled.div`
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background-color: rgba(0, 0, 0, 0.7);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-`;
-
-const ModalContent = styled.div`
-  background-color: ${({ theme }) => theme.colors.surface};
-  border-radius: ${({ theme }) => theme.borderRadius.md};
-  padding: ${({ theme }) => theme.spacing.lg};
-  width: 90%;
-  max-width: 500px;
-  max-height: 90vh;
-  overflow-y: auto;
-  box-shadow: ${({ theme }) => theme.shadows.lg};
-`;
-
-const ModalHeader = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: ${({ theme }) => theme.spacing.md};
-  
-  h2 {
-    margin: 0;
-  }
-`;
-
-const CloseButton = styled.button`
-  background: none;
-  border: none;
-  color: ${({ theme }) => theme.colors.onBackground};
-  font-size: ${({ theme }) => theme.fontSizes.xl};
-  cursor: pointer;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: ${({ theme }) => theme.borderRadius.circle};
-  
-  &:hover {
-    background-color: ${({ theme }) => theme.colors.surfaceLight};
-  }
-`;
-
-// Mock data for SOL to USD conversion (in a real app, this would come from an API or be stored locally)
-const SOL_TO_USD = 150.75; // Example price
-
-// App component
-const App: React.FC = () => {
-  // Authentication states
-  const [isPinSetup, setIsPinSetup] = useState<boolean | null>(null);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+function App() {
+  // State management
+  const [authenticated, setAuthenticated] = useState(false);
   const [pin, setPin] = useState('');
-  const [confirmPin, setConfirmPin] = useState('');
-  const [pinError, setPinError] = useState('');
-  
-  // Navigation state
+  const [walletConnected, setWalletConnected] = useState(false);
+  const [walletBalance, setWalletBalance] = useState(0);
+  const [usdBalance, setUsdBalance] = useState(0);
+  const [solPrice, setSolPrice] = useState(150.25); // Mock SOL price in USD
   const [activeTab, setActiveTab] = useState('dashboard');
-  
-  // Wallet states
-  const [wallets, setWallets] = useState<any[]>([]);
-  const [selectedWallet, setSelectedWallet] = useState<string | null>(null);
-  const [isImportingWallet, setIsImportingWallet] = useState(false);
-  const [importMethod, setImportMethod] = useState<'file' | 'seed' | null>(null);
-  const [seedPhrase, setSeedPhrase] = useState('');
-  const [walletName, setWalletName] = useState('');
-  
-  // Trading states
   const [isTrading, setIsTrading] = useState(false);
-  const [tradingProgress, setTradingProgress] = useState(0);
-  const [solBalance, setSolBalance] = useState(0.05); // Starting with 0.05 SOL
-  const [profitSol, setProfitSol] = useState(0);
-  const [tradesExecuted, setTradesExecuted] = useState(0);
-  const [tradingLogs, setTradingLogs] = useState<string[]>([]);
-  
-  // Chart data
-  const [chartData, setChartData] = useState({
-    labels: Array.from({ length: 10 }, (_, i) => (i + 1).toString()),
+  const [tradingStrategy, setTradingStrategy] = useState('arbitrage');
+  const [profitToday, setProfitToday] = useState(0);
+  const [totalProfit, setTotalProfit] = useState(0);
+  const [tradeCount, setTradeCount] = useState(0);
+  const [successRate, setSuccessRate] = useState(0);
+  const [showWalletImport, setShowWalletImport] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [balanceHistory, setBalanceHistory] = useState(mockBalanceHistory);
+  const [currentProgress, setCurrentProgress] = useState(0);
+  const [currentOperation, setCurrentOperation] = useState('');
+
+  // Authentication effect
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const isAuth = await invoke('check_authentication');
+        setAuthenticated(isAuth);
+        if (isAuth) {
+          fetchWalletData();
+        }
+      } catch (error) {
+        console.error('Authentication check failed:', error);
+      }
+    };
+    
+    checkAuth();
+    
+    // Mock data updates for demo purposes
+    if (authenticated && walletConnected) {
+      const interval = setInterval(() => {
+        if (isTrading) {
+          updateMockData();
+        }
+      }, 5000);
+      
+      return () => clearInterval(interval);
+    }
+  }, [authenticated, walletConnected, isTrading]);
+
+  // Update mock trading data
+  const updateMockData = () => {
+    // Update balance with small fluctuations
+    const newBalance = walletBalance + (Math.random() * 0.02 - 0.01);
+    setWalletBalance(newBalance);
+    setUsdBalance(newBalance * solPrice);
+    
+    // Update profit
+    const newProfit = profitToday + (Math.random() * 0.005);
+    setProfitToday(newProfit);
+    setTotalProfit(totalProfit + (Math.random() * 0.002));
+    
+    // Update trade count occasionally
+    if (Math.random() > 0.7) {
+      setTradeCount(tradeCount + 1);
+      setSuccessRate(Math.min(100, successRate + (Math.random() > 0.8 ? 1 : -0.5)));
+      
+      // Add notification
+      const strategies = ['arbitrage', 'sandwich', 'flashloan'];
+      const tokens = ['SOL/USDC', 'RAY/USDC', 'BONK/SOL', 'JUP/USDC'];
+      const profitAmount = (Math.random() * 0.01).toFixed(4);
+      
+      setNotifications(prev => [
+        {
+          id: Date.now(),
+          type: Math.random() > 0.2 ? 'success' : 'warning',
+          message: `${Math.random() > 0.2 ? 'Successful' : 'Attempted'} ${strategies[Math.floor(Math.random() * strategies.length)]} trade on ${tokens[Math.floor(Math.random() * tokens.length)]} (${profitAmount} SOL)`
+        },
+        ...prev.slice(0, 9)
+      ]);
+    }
+    
+    // Update chart data
+    const now = new Date();
+    const timeStr = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+    
+    setBalanceHistory(prev => [
+      ...prev.slice(1),
+      {
+        time: timeStr,
+        balance: newBalance,
+        profit: (Math.random() * 0.01).toFixed(4)
+      }
+    ]);
+    
+    // Update progress for current operation
+    if (currentOperation) {
+      const newProgress = currentProgress + Math.random() * 10;
+      if (newProgress >= 100) {
+        setCurrentProgress(0);
+        setCurrentOperation('');
+      } else {
+        setCurrentProgress(newProgress);
+      }
+    } else if (Math.random() > 0.9) {
+      // Occasionally start a new operation
+      const operations = [
+        'Scanning for arbitrage opportunities',
+        'Analyzing price impact',
+        'Preparing sandwich trade',
+        'Optimizing trade route',
+        'Calculating slippage'
+      ];
+      setCurrentOperation(operations[Math.floor(Math.random() * operations.length)]);
+      setCurrentProgress(Math.random() * 30);
+    }
+  };
+
+  // Fetch wallet data from backend
+  const fetchWalletData = async () => {
+    try {
+      const walletData = await invoke('get_wallet_data');
+      setWalletConnected(true);
+      setWalletBalance(walletData.balance);
+      setUsdBalance(walletData.balance * solPrice);
+    } catch (error) {
+      console.error('Failed to fetch wallet data:', error);
+    }
+  };
+
+  // Handle PIN authentication
+  const handleAuthenticate = async () => {
+    if (pin.length !== 4) return;
+    
+    try {
+      const result = await invoke('authenticate', { pin });
+      if (result) {
+        setAuthenticated(true);
+        fetchWalletData();
+      } else {
+        alert('Invalid PIN. Please try again.');
+      }
+    } catch (error) {
+      console.error('Authentication failed:', error);
+      alert('Authentication failed. Please try again.');
+    }
+  };
+
+  // Handle trading start/stop
+  const toggleTrading = async () => {
+    if (!walletConnected) {
+      setShowWalletImport(true);
+      return;
+    }
+    
+    try {
+      if (isTrading) {
+        await invoke('stop_trading');
+      } else {
+        await invoke('start_trading', { strategy: tradingStrategy });
+        // Start a new operation
+        setCurrentOperation('Initializing trading engine');
+        setCurrentProgress(5);
+      }
+      setIsTrading(!isTrading);
+    } catch (error) {
+      console.error('Failed to toggle trading:', error);
+      alert(`Failed to ${isTrading ? 'stop' : 'start'} trading. Please try again.`);
+    }
+  };
+
+  // Handle wallet import completion
+  const handleWalletImported = (success) => {
+    setShowWalletImport(false);
+    if (success) {
+      setWalletConnected(true);
+      fetchWalletData();
+    }
+  };
+
+  // Chart configuration
+  const chartData = {
+    labels: balanceHistory.map(item => item.time),
     datasets: [
       {
-        label: 'Balance (SOL)',
-        data: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
-        borderColor: theme.colors.primary,
-        backgroundColor: 'rgba(187, 134, 252, 0.1)',
-        tension: 0.4,
-      },
-    ],
-  });
-  
-  // Check if PIN is set up on component mount
-  useEffect(() => {
-    const checkPinSetup = async () => {
-      try {
-        const result = await invoke('is_pin_setup');
-        setIsPinSetup(result as boolean);
-      } catch (error) {
-        console.error('Failed to check PIN setup:', error);
-        setIsPinSetup(false);
+        label: 'Wallet Balance (SOL)',
+        data: balanceHistory.map(item => item.balance),
+        borderColor: 'rgba(75, 192, 192, 1)',
+        backgroundColor: 'rgba(75, 192, 192, 0.2)',
+        tension: 0.4
       }
-    };
-    
-    checkPinSetup();
-  }, []);
-  
-  // Load wallets after authentication
-  useEffect(() => {
-    if (isAuthenticated) {
-      loadWallets();
-    }
-  }, [isAuthenticated]);
-  
-  // Simulated trading effect
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    
-    if (isTrading) {
-      interval = setInterval(() => {
-        // Simulate trade execution
-        const randomProfit = (Math.random() * 0.002) - 0.0005; // Random profit between -0.0005 and 0.0015 SOL
-        const newProfit = profitSol + randomProfit;
-        const newBalance = solBalance + randomProfit;
-        
-        setProfitSol(newProfit);
-        setSolBalance(newBalance);
-        setTradesExecuted(prev => prev + 1);
-        setTradingProgress(Math.random() * 100);
-        
-        // Add log entry
-        const profitText = randomProfit >= 0 ? `+${randomProfit.toFixed(6)}` : `${randomProfit.toFixed(6)}`;
-        const logEntry = `[${new Date().toLocaleTimeString()}] Executed trade: ${profitText} SOL`;
-        setTradingLogs(prev => [logEntry, ...prev].slice(0, 100));
-        
-        // Update chart data
-        setChartData(prev => {
-          const newLabels = [...prev.labels.slice(1), (parseInt(prev.labels[prev.labels.length - 1]) + 1).toString()];
-          const newData = [...prev.datasets[0].data.slice(1), newBalance];
-          
-          return {
-            labels: newLabels,
-            datasets: [
-              {
-                ...prev.datasets[0],
-                data: newData,
-              },
-            ],
-          };
-        });
-      }, 3000);
-    }
-    
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [isTrading, profitSol, solBalance]);
-  
-  // Handle PIN setup
-  const handlePinSetup = async () => {
-    if (pin.length !== 4 || !/^\d+$/.test(pin)) {
-      setPinError('PIN must be exactly 4 digits');
-      return;
-    }
-    
-    if (pin !== confirmPin) {
-      setPinError('PINs do not match');
-      return;
-    }
-    
-    try {
-      await invoke('setup_pin', { pin });
-      setIsPinSetup(true);
-      setIsAuthenticated(true);
-      setPinError('');
-    } catch (error) {
-      console.error('Failed to set up PIN:', error);
-      setPinError('Failed to set up PIN');
-    }
+    ]
   };
-  
-  // Handle PIN verification
-  const handlePinVerification = async () => {
-    if (pin.length !== 4 || !/^\d+$/.test(pin)) {
-      setPinError('PIN must be exactly 4 digits');
-      return;
-    }
-    
-    try {
-      const result = await invoke('verify_pin', { pin });
-      if (result) {
-        setIsAuthenticated(true);
-        setPinError('');
-      } else {
-        setPinError('Invalid PIN');
-      }
-    } catch (error) {
-      console.error('Failed to verify PIN:', error);
-      setPinError('Failed to verify PIN');
-    }
-  };
-  
-  // Load wallets
-  const loadWallets = async () => {
-    try {
-      const result = await invoke('list_wallets');
-      setWallets(result as any[]);
-      
-      if ((result as any[]).length > 0) {
-        setSelectedWallet((result as any[])[0].name);
-      }
-    } catch (error) {
-      console.error('Failed to load wallets:', error);
-    }
-  };
-  
-  // Import wallet
-  const handleWalletImport = async () => {
-    if (!walletName) {
-      alert('Please enter a wallet name');
-      return;
-    }
-    
-    try {
-      let result;
-      
-      if (importMethod === 'file') {
-        // In a real app, this would open a file picker
-        alert('File import would open a file picker here');
-        return;
-      } else if (importMethod === 'seed') {
-        if (!seedPhrase) {
-          alert('Please enter a seed phrase');
-          return;
+
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        position: 'top',
+        labels: {
+          color: 'rgba(255, 255, 255, 0.7)'
         }
-        
-        result = await invoke('import_from_seed_phrase', { 
-          name: walletName,
-          seedPhrase,
-          passphrase: '',
-          pin
-        });
+      },
+      tooltip: {
+        mode: 'index',
+        intersect: false,
       }
-      
-      setIsImportingWallet(false);
-      setImportMethod(null);
-      setSeedPhrase('');
-      setWalletName('');
-      
-      // Reload wallets
-      loadWallets();
-    } catch (error) {
-      console.error('Failed to import wallet:', error);
-      alert(`Failed to import wallet: ${error}`);
+    },
+    scales: {
+      y: {
+        ticks: { color: 'rgba(255, 255, 255, 0.7)' },
+        grid: { color: 'rgba(255, 255, 255, 0.1)' }
+      },
+      x: {
+        ticks: { color: 'rgba(255, 255, 255, 0.7)' },
+        grid: { color: 'rgba(255, 255, 255, 0.1)' }
+      }
     }
   };
-  
-  // Start trading
-  const startTrading = async () => {
-    if (!selectedWallet) {
-      alert('Please select a wallet');
-      return;
-    }
-    
-    try {
-      await invoke('start_trading', { wallet: selectedWallet });
-      setIsTrading(true);
-    } catch (error) {
-      console.error('Failed to start trading:', error);
-      alert(`Failed to start trading: ${error}`);
-    }
-  };
-  
-  // Stop trading
-  const stopTrading = async () => {
-    try {
-      await invoke('stop_trading');
-      setIsTrading(false);
-    } catch (error) {
-      console.error('Failed to stop trading:', error);
-      alert(`Failed to stop trading: ${error}`);
-    }
-  };
-  
-  // Render authentication screen
-  const renderAuthScreen = () => {
-    if (isPinSetup === null) {
-      return (
-        <Card>
-          <h2>Loading...</h2>
-          <p>Checking PIN setup status...</p>
-        </Card>
-      );
-    }
-    
-    if (!isPinSetup) {
-      return (
-        <Card>
-          <h2>Welcome to Skyscope Solana MEV Bot</h2>
-          <p>Please set up a 4-digit PIN to secure your wallet and trading operations.</p>
-          
-          <FormGroup>
-            <Label htmlFor="pin">Enter a 4-digit PIN</Label>
-            <PinInput
-              id="pin"
-              type="password"
-              maxLength={4}
-              value={pin}
-              onChange={(e) => setPin(e.target.value)}
-              placeholder="****"
-            />
-          </FormGroup>
-          
-          <FormGroup>
-            <Label htmlFor="confirmPin">Confirm PIN</Label>
-            <PinInput
-              id="confirmPin"
-              type="password"
-              maxLength={4}
-              value={confirmPin}
-              onChange={(e) => setConfirmPin(e.target.value)}
-              placeholder="****"
-            />
-          </FormGroup>
-          
-          {pinError && <p style={{ color: theme.colors.error }}>{pinError}</p>}
-          
-          <Button onClick={handlePinSetup}>Set PIN</Button>
-        </Card>
-      );
-    }
-    
+
+  // Render PIN authentication screen
+  if (!authenticated) {
     return (
-      <Card>
-        <h2>Welcome Back</h2>
-        <p>Enter your PIN to continue.</p>
-        
-        <FormGroup>
-          <Label htmlFor="pin">Enter your 4-digit PIN</Label>
-          <PinInput
-            id="pin"
+      <div className="auth-container">
+        <div className="auth-card">
+          <h1>Skyscope Solana MEV Bot</h1>
+          <p>Enter your 4-digit PIN to unlock</p>
+          <input
             type="password"
             maxLength={4}
             value={pin}
-            onChange={(e) => setPin(e.target.value)}
-            placeholder="****"
+            onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ''))}
+            placeholder="PIN"
+            className="pin-input"
           />
-        </FormGroup>
-        
-        {pinError && <p style={{ color: theme.colors.error }}>{pinError}</p>}
-        
-        <Button onClick={handlePinVerification}>Unlock</Button>
-      </Card>
+          <button 
+            className="auth-button"
+            onClick={handleAuthenticate}
+            disabled={pin.length !== 4}
+          >
+            Unlock
+          </button>
+        </div>
+      </div>
     );
-  };
-  
-  // Render wallet import modal
-  const renderWalletImportModal = () => {
-    if (!isImportingWallet) return null;
-    
-    return (
-      <Modal>
-        <ModalContent>
-          <ModalHeader>
-            <h2>Import Wallet</h2>
-            <CloseButton onClick={() => setIsImportingWallet(false)}>×</CloseButton>
-          </ModalHeader>
-          
-          <FormGroup>
-            <Label htmlFor="walletName">Wallet Name</Label>
-            <Input
-              id="walletName"
-              type="text"
-              value={walletName}
-              onChange={(e) => setWalletName(e.target.value)}
-              placeholder="My Wallet"
-            />
-          </FormGroup>
-          
-          <FormGroup>
-            <Label>Import Method</Label>
-            <Flex>
-              <Button
-                variant={importMethod === 'file' ? 'primary' : 'secondary'}
-                onClick={() => setImportMethod('file')}
-              >
-                Keypair File
-              </Button>
-              <Button
-                variant={importMethod === 'seed' ? 'primary' : 'secondary'}
-                onClick={() => setImportMethod('seed')}
-              >
-                Seed Phrase
-              </Button>
-            </Flex>
-          </FormGroup>
-          
-          {importMethod === 'file' && (
-            <FormGroup>
-              <Label htmlFor="keypairFile">Keypair File</Label>
-              <Input
-                id="keypairFile"
-                type="file"
-                accept=".json"
-              />
-              <p style={{ fontSize: theme.fontSizes.sm, opacity: 0.7, marginTop: theme.spacing.xs }}>
-                Select your Solflare or other Solana wallet JSON file.
-              </p>
-            </FormGroup>
-          )}
-          
-          {importMethod === 'seed' && (
-            <FormGroup>
-              <Label htmlFor="seedPhrase">Seed Phrase</Label>
-              <Input
-                id="seedPhrase"
-                as="textarea"
-                rows={3}
-                value={seedPhrase}
-                onChange={(e) => setSeedPhrase(e.target.value)}
-                placeholder="Enter your 12 or 24 word seed phrase"
-                style={{ resize: 'vertical' }}
-              />
-              <p style={{ fontSize: theme.fontSizes.sm, opacity: 0.7, marginTop: theme.spacing.xs }}>
-                Enter your 12 or 24 word seed phrase separated by spaces.
-              </p>
-            </FormGroup>
-          )}
-          
-          <Flex justify="flex-end" gap={theme.spacing.sm}>
-            <Button variant="error" onClick={() => setIsImportingWallet(false)}>Cancel</Button>
-            <Button onClick={handleWalletImport}>Import</Button>
-          </Flex>
-        </ModalContent>
-      </Modal>
-    );
-  };
-  
-  // Render wallet management
-  const renderWalletManagement = () => {
-    return (
-      <>
-        <h2>Wallet Management</h2>
-        
-        <Flex justify="space-between" align="center" style={{ marginBottom: theme.spacing.md }}>
-          <h3>Your Wallets</h3>
-          <Button onClick={() => setIsImportingWallet(true)}>Import Wallet</Button>
-        </Flex>
-        
-        {wallets.length === 0 ? (
-          <Card>
-            <p>No wallets found. Import a wallet to get started.</p>
-            <Button onClick={() => setIsImportingWallet(true)}>Import Wallet</Button>
-          </Card>
-        ) : (
-          <div>
-            {wallets.map((wallet, index) => (
-              <Card key={index} style={{ 
-                borderLeft: selectedWallet === wallet.name ? `4px solid ${theme.colors.primary}` : 'none',
-                cursor: 'pointer'
-              }} onClick={() => setSelectedWallet(wallet.name)}>
-                <Flex justify="space-between" align="center">
-                  <div>
-                    <h3>{wallet.name}</h3>
-                    <p style={{ fontSize: theme.fontSizes.sm, opacity: 0.7 }}>{wallet.pubkey}</p>
-                  </div>
-                  <Badge variant={selectedWallet === wallet.name ? 'primary' : 'secondary'}>
-                    {selectedWallet === wallet.name ? 'Selected' : 'Select'}
-                  </Badge>
-                </Flex>
-              </Card>
-            ))}
-          </div>
-        )}
-        
-        {renderWalletImportModal()}
-      </>
-    );
-  };
-  
-  // Render dashboard
-  const renderDashboard = () => {
-    return (
-      <>
-        <h2>Trading Dashboard</h2>
-        
-        <Flex gap={theme.spacing.md} style={{ marginBottom: theme.spacing.md }}>
-          <Stat style={{ flex: 1 }}>
-            <span className="label">Current Balance</span>
-            <span className="value">{solBalance.toFixed(6)} SOL</span>
-            <span className="subvalue">${(solBalance * SOL_TO_USD).toFixed(2)} USD</span>
-          </Stat>
-          
-          <Stat style={{ flex: 1 }}>
-            <span className="label">Profit/Loss</span>
-            <span className="value" style={{ color: profitSol >= 0 ? theme.colors.success : theme.colors.error }}>
-              {profitSol >= 0 ? '+' : ''}{profitSol.toFixed(6)} SOL
-            </span>
-            <span className="subvalue">${(profitSol * SOL_TO_USD).toFixed(2)} USD</span>
-          </Stat>
-          
-          <Stat style={{ flex: 1 }}>
-            <span className="label">Trades Executed</span>
-            <span className="value">{tradesExecuted}</span>
-            <span className="subvalue">Since start</span>
-          </Stat>
-        </Flex>
-        
-        <Card>
-          <Flex justify="space-between" align="center" style={{ marginBottom: theme.spacing.md }}>
-            <h3>Trading Activity</h3>
-            {isTrading ? (
-              <Button variant="error" onClick={stopTrading}>Stop Trading</Button>
-            ) : (
-              <Button variant="success" onClick={startTrading}>Start Trading</Button>
-            )}
-          </Flex>
-          
-          <div style={{ height: '300px' }}>
-            <Line 
-              data={chartData}
-              options={{
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                  legend: {
-                    position: 'top',
-                  },
-                  title: {
-                    display: true,
-                    text: 'Balance History',
-                  },
-                },
-                scales: {
-                  y: {
-                    beginAtZero: false,
-                  },
-                },
-              }}
-            />
-          </div>
-          
-          {isTrading && (
-            <>
-              <h4 style={{ marginTop: theme.spacing.md }}>Current Operation</h4>
-              <ProgressBarContainer>
-                <ProgressBarFill progress={tradingProgress} />
-              </ProgressBarContainer>
-              <p>Scanning for opportunities...</p>
-            </>
-          )}
-        </Card>
-        
-        <Card>
-          <h3>Trading Logs</h3>
-          <CodeBlock>
-            {tradingLogs.length === 0 ? (
-              'No trading activity yet. Start trading to see logs.'
-            ) : (
-              tradingLogs.map((log, index) => (
-                <div key={index}>{log}</div>
-              ))
-            )}
-          </CodeBlock>
-        </Card>
-      </>
-    );
-  };
-  
-  // Render settings
-  const renderSettings = () => {
-    return (
-      <>
-        <h2>Settings</h2>
-        
-        <Card>
-          <h3>Trading Parameters</h3>
-          
-          <FormGroup>
-            <Label htmlFor="tradingAmount">Trading Amount (SOL)</Label>
-            <Input
-              id="tradingAmount"
-              type="number"
-              min="0.05"
-              step="0.01"
-              defaultValue="0.1"
-            />
-          </FormGroup>
-          
-          <FormGroup>
-            <Label htmlFor="maxSlippage">Max Slippage (%)</Label>
-            <Input
-              id="maxSlippage"
-              type="number"
-              min="0.1"
-              max="5.0"
-              step="0.1"
-              defaultValue="1.0"
-            />
-          </FormGroup>
-          
-          <FormGroup>
-            <Label htmlFor="strategy">Trading Strategy</Label>
-            <select
-              id="strategy"
-              style={{
-                backgroundColor: theme.colors.surfaceLight,
-                color: theme.colors.onSurface,
-                border: `1px solid ${theme.colors.surfaceLight}`,
-                borderRadius: theme.borderRadius.md,
-                padding: `${theme.spacing.sm} ${theme.spacing.md}`,
-                fontSize: theme.fontSizes.md,
-                width: '100%',
-              }}
-            >
-              <option value="0">MEV Arbitrage</option>
-              <option value="1">Sandwich Trading</option>
-              <option value="2">Flashloan Arbitrage</option>
-              <option value="3">Liquidity Sniping</option>
-            </select>
-          </FormGroup>
-          
-          <Button>Save Settings</Button>
-        </Card>
-        
-        <Card>
-          <h3>Security</h3>
-          
-          <Button>Change PIN</Button>
-        </Card>
-      </>
-    );
-  };
-  
-  // Render help
-  const renderHelp = () => {
-    return (
-      <>
-        <h2>Help & Guide</h2>
-        
-        <Card>
-          <h3>Getting Started</h3>
-          <p>Welcome to the Skyscope Solana MEV Bot! This guide will help you get started with the application.</p>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>Step 1: Import Your Wallet</h4>
-          <p>Start by importing your Solflare wallet or any other Solana wallet. You can do this from the Wallet tab.</p>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>Step 2: Configure Trading Settings</h4>
-          <p>Go to the Settings tab to configure your trading parameters, such as the amount to trade, maximum slippage, and trading strategy.</p>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>Step 3: Start Trading</h4>
-          <p>Once your wallet is imported and settings are configured, go to the Dashboard tab and click "Start Trading" to begin.</p>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>Step 4: Monitor Your Profits</h4>
-          <p>The Dashboard will show you real-time information about your trading activity, including your current balance, profit/loss, and trading logs.</p>
-        </Card>
-        
-        <Card>
-          <h3>Frequently Asked Questions</h3>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>What is MEV?</h4>
-          <p>MEV (Maximal Extractable Value) refers to the maximum value that can be extracted from block production in excess of the standard block reward and gas fees by including, excluding, or reordering transactions in a block.</p>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>How does the bot make money?</h4>
-          <p>The bot uses various strategies such as arbitrage between different DEXs, sandwich trading, and flashloan arbitrage to capture value from the Solana blockchain.</p>
-          
-          <h4 style={{ marginTop: theme.spacing.md }}>Is my seed phrase safe?</h4>
-          <p>Yes, your seed phrase is never stored on disk. It is only used once to derive your keypair, which is then encrypted with your PIN and stored securely.</p>
-        </Card>
-      </>
-    );
-  };
-  
-  // Render main content based on active tab
-  const renderContent = () => {
-    switch (activeTab) {
-      case 'dashboard':
-        return renderDashboard();
-      case 'wallet':
-        return renderWalletManagement();
-      case 'settings':
-        return renderSettings();
-      case 'help':
-        return renderHelp();
-      default:
-        return renderDashboard();
-    }
-  };
-  
+  }
+
+  // Render main application
   return (
-    <ThemeProvider theme={theme}>
-      <GlobalStyle />
-      <AppContainer>
-        {!isAuthenticated ? (
-          <Flex direction="column" justify="center" align="center" style={{ height: '100vh' }}>
-            {renderAuthScreen()}
-          </Flex>
-        ) : (
-          <>
-            <Header>
-              <Logo>
-                <h1>Skyscope Solana MEV Bot</h1>
-              </Logo>
-              <Flex>
-                <Button variant="secondary" onClick={() => setIsAuthenticated(false)}>Logout</Button>
-              </Flex>
-            </Header>
-            
-            <MainContent>
-              <Sidebar>
-                <NavItem active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')}>
-                  Dashboard
-                </NavItem>
-                <NavItem active={activeTab === 'wallet'} onClick={() => setActiveTab('wallet')}>
-                  Wallet
-                </NavItem>
-                <NavItem active={activeTab === 'settings'} onClick={() => setActiveTab('settings')}>
-                  Settings
-                </NavItem>
-                <NavItem active={activeTab === 'help'} onClick={() => setActiveTab('help')}>
-                  Help & Guide
-                </NavItem>
-                
-                {selectedWallet && (
-                  <Card style={{ marginTop: 'auto' }}>
-                    <h4>Selected Wallet</h4>
-                    <p>{selectedWallet}</p>
-                    {isTrading ? (
-                      <Badge variant="success">Trading Active</Badge>
-                    ) : (
-                      <Badge variant="warning">Trading Inactive</Badge>
-                    )}
-                  </Card>
-                )}
-              </Sidebar>
+    <div className="app-container">
+      {/* Sidebar */}
+      <div className="sidebar">
+        <div className="logo">
+          <h2>Skyscope</h2>
+          <p>Solana MEV Bot</p>
+        </div>
+        
+        <nav className="nav-menu">
+          <button 
+            className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`}
+            onClick={() => setActiveTab('dashboard')}
+          >
+            Dashboard
+          </button>
+          <button 
+            className={`nav-item ${activeTab === 'wallet' ? 'active' : ''}`}
+            onClick={() => setActiveTab('wallet')}
+          >
+            Wallet
+          </button>
+          <button 
+            className={`nav-item ${activeTab === 'settings' ? 'active' : ''}`}
+            onClick={() => setActiveTab('settings')}
+          >
+            Settings
+          </button>
+        </nav>
+        
+        <div className="sidebar-footer">
+          <p>v1.0.0</p>
+        </div>
+      </div>
+      
+      {/* Main content */}
+      <div className="main-content">
+        {/* Header */}
+        <header className="header">
+          <h1>{activeTab.charAt(0).toUpperCase() + activeTab.slice(1)}</h1>
+          
+          <div className="wallet-status">
+            {walletConnected ? (
+              <>
+                <div className="balance-display">
+                  <span className="balance-amount">{walletBalance.toFixed(4)} SOL</span>
+                  <span className="balance-usd">(${usdBalance.toFixed(2)})</span>
+                </div>
+                <div className="connection-status connected">
+                  Connected
+                </div>
+              </>
+            ) : (
+              <button 
+                className="connect-wallet-button"
+                onClick={() => setShowWalletImport(true)}
+              >
+                Connect Wallet
+              </button>
+            )}
+          </div>
+        </header>
+        
+        {/* Dashboard content */}
+        {activeTab === 'dashboard' && (
+          <div className="dashboard">
+            {/* Stats cards */}
+            <div className="stats-container">
+              <div className="stat-card">
+                <h3>Profit Today</h3>
+                <div className="stat-value">
+                  <span>{profitToday.toFixed(4)} SOL</span>
+                  <span className="stat-usd">${(profitToday * solPrice).toFixed(2)}</span>
+                </div>
+              </div>
               
-              <Content>
-                {renderContent()}
-              </Content>
-            </MainContent>
-          </>
+              <div className="stat-card">
+                <h3>Total Profit</h3>
+                <div className="stat-value">
+                  <span>{totalProfit.toFixed(4)} SOL</span>
+                  <span className="stat-usd">${(totalProfit * solPrice).toFixed(2)}</span>
+                </div>
+              </div>
+              
+              <div className="stat-card">
+                <h3>Trades</h3>
+                <div className="stat-value">{tradeCount}</div>
+              </div>
+              
+              <div className="stat-card">
+                <h3>Success Rate</h3>
+                <div className="stat-value">{successRate.toFixed(1)}%</div>
+              </div>
+            </div>
+            
+            {/* Chart */}
+            <div className="chart-container">
+              <h3>Balance History</h3>
+              <div className="chart-wrapper">
+                <Line data={chartData} options={chartOptions} />
+              </div>
+            </div>
+            
+            {/* Trading controls */}
+            <div className="trading-controls">
+              <div className="strategy-selector">
+                <h3>Trading Strategy</h3>
+                <select 
+                  value={tradingStrategy}
+                  onChange={(e) => setTradingStrategy(e.target.value)}
+                  disabled={isTrading}
+                >
+                  <option value="arbitrage">Arbitrage</option>
+                  <option value="sandwich">Sandwich Trading</option>
+                  <option value="flashloan">Flashloan Arbitrage</option>
+                  <option value="liquidity">Liquidity Sniping</option>
+                </select>
+              </div>
+              
+              <button 
+                className={`trading-button ${isTrading ? 'stop' : 'start'}`}
+                onClick={toggleTrading}
+                disabled={!walletConnected && !isTrading}
+              >
+                {isTrading ? 'Stop Trading' : 'Start Trading'}
+              </button>
+            </div>
+            
+            {/* Current operation */}
+            {currentOperation && (
+              <div className="operation-status">
+                <h3>{currentOperation}</h3>
+                <div className="progress-bar-container">
+                  <div 
+                    className="progress-bar" 
+                    style={{ width: `${currentProgress}%` }}
+                  ></div>
+                </div>
+              </div>
+            )}
+            
+            {/* Notifications */}
+            <div className="notifications">
+              <h3>Recent Activity</h3>
+              {notifications.length === 0 ? (
+                <p className="no-activity">No recent activity</p>
+              ) : (
+                <ul className="notification-list">
+                  {notifications.map(notification => (
+                    <li 
+                      key={notification.id}
+                      className={`notification-item ${notification.type}`}
+                    >
+                      {notification.message}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
         )}
-      </AppContainer>
-    </ThemeProvider>
+        
+        {/* Wallet content */}
+        {activeTab === 'wallet' && (
+          <div className="wallet-page">
+            <h2>Wallet Management</h2>
+            
+            {walletConnected ? (
+              <div className="wallet-details">
+                <div className="wallet-info-card">
+                  <h3>Wallet Balance</h3>
+                  <div className="wallet-balance">
+                    <span className="sol-amount">{walletBalance.toFixed(4)} SOL</span>
+                    <span className="usd-amount">${usdBalance.toFixed(2)}</span>
+                  </div>
+                </div>
+                
+                <button 
+                  className="import-new-wallet"
+                  onClick={() => setShowWalletImport(true)}
+                >
+                  Import Different Wallet
+                </button>
+              </div>
+            ) : (
+              <div className="wallet-connect-prompt">
+                <p>Connect your wallet to start trading</p>
+                <button 
+                  className="connect-wallet-button large"
+                  onClick={() => setShowWalletImport(true)}
+                >
+                  Connect Wallet
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        
+        {/* Settings content */}
+        {activeTab === 'settings' && (
+          <div className="settings-page">
+            <h2>Settings</h2>
+            
+            <div className="settings-section">
+              <h3>Security</h3>
+              <button className="settings-button">Change PIN</button>
+            </div>
+            
+            <div className="settings-section">
+              <h3>Trading Parameters</h3>
+              
+              <div className="setting-item">
+                <label>Maximum Trade Size (SOL)</label>
+                <input type="number" defaultValue={1} min={0.1} step={0.1} />
+              </div>
+              
+              <div className="setting-item">
+                <label>Maximum Slippage (%)</label>
+                <input type="number" defaultValue={1} min={0.1} max={5} step={0.1} />
+              </div>
+              
+              <div className="setting-item">
+                <label>Auto Stop-Loss (%)</label>
+                <input type="number" defaultValue={5} min={1} max={20} step={1} />
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+      
+      {/* Wallet import modal */}
+      {showWalletImport && (
+        <WalletImport onComplete={handleWalletImported} />
+      )}
+    </div>
   );
-};
+}
 
 export default App;
