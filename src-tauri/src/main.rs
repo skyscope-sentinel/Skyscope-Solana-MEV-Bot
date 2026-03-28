@@ -1,885 +1,635 @@
-//! Skyscope Solana MEV Bot - Tauri Application
-//!
-//! This is the entry point for the Tauri application that provides a GUI for the
-//! Skyscope Solana MEV Bot. It integrates the existing Rust backend with a React frontend.
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
-use log::{debug, error, info, warn, LevelFilter};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{
-    api::path::{home_dir, app_dir},
-    AppHandle, Manager, State, Window,
-};
-use tauri_plugin_store::StoreBuilder;
+use serde::{Deserialize, Serialize};
+use tauri::{Manager, State};
 use tokio::sync::RwLock;
-use tokio::task;
-use tokio::time::sleep;
+use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, NewAead, generic_array::GenericArray};
+use rand::{rngs::OsRng, RngCore};
+use argon2::{self, Config, ThreadMode, Variant, Version};
+use solana_sdk::{
+    pubkey::Pubkey,
+    signature::{Keypair, read_keypair_file},
+    signer::Signer,
+};
+use solana_client::rpc_client::RpcClient;
+use std::str::FromStr;
+use std::fs;
+use std::path::PathBuf;
+use std::io::Read;
+use bip39::{Mnemonic, Language};
+use hex;
 
-// Import our existing modules
-mod authentication;
-mod keystore;
-mod security;
-mod trading;
-mod app;
-
-// Re-export the modules we need
-use authentication::{Authentication, AuthError};
-use keystore::{Keystore, KeystoreError};
-use security::{Security, SecurityError};
-use trading::{Trading, TradingError, TradingStats, TradingStrategy};
-
-// Define application state
-struct AppState {
-    auth: Arc<Mutex<Option<Authentication>>>,
-    keystore: Arc<Mutex<Option<Keystore>>>,
-    trading: Arc<RwLock<Option<Trading>>>,
-    session_start: Arc<Mutex<Option<Instant>>>,
-    session_timeout: Arc<Mutex<Duration>>,
-    is_trading: Arc<Mutex<bool>>,
-    trading_stats: Arc<RwLock<TradingStats>>,
-    sol_to_usd_rate: Arc<Mutex<f64>>,
+// Session management
+struct SessionState {
+    authenticated: bool,
+    last_activity: Instant,
+    keypair: Option<Keypair>,
+    wallet_name: Option<String>,
+    trading_active: bool,
+    trading_strategy: Option<String>,
 }
 
-impl AppState {
+impl SessionState {
     fn new() -> Self {
         Self {
-            auth: Arc::new(Mutex::new(None)),
-            keystore: Arc::new(Mutex::new(None)),
-            trading: Arc::new(RwLock::new(None)),
-            session_start: Arc::new(Mutex::new(None)),
-            session_timeout: Arc::new(Mutex::new(Duration::from_secs(15 * 60))), // 15 minutes default
-            is_trading: Arc::new(Mutex::new(false)),
-            trading_stats: Arc::new(RwLock::new(TradingStats::default())),
-            sol_to_usd_rate: Arc::new(Mutex::new(150.75)), // Default SOL to USD rate
+            authenticated: false,
+            last_activity: Instant::now(),
+            keypair: None,
+            wallet_name: None,
+            trading_active: false,
+            trading_strategy: None,
         }
     }
-}
 
-// Error type for Tauri commands
-#[derive(Debug, thiserror::Error)]
-enum CommandError {
-    #[error("Authentication error: {0}")]
-    Auth(#[from] AuthError),
-    
-    #[error("Keystore error: {0}")]
-    Keystore(#[from] KeystoreError),
-    
-    #[error("Security error: {0}")]
-    Security(#[from] SecurityError),
-    
-    #[error("Trading error: {0}")]
-    Trading(#[from] TradingError),
-    
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("Session expired")]
-    SessionExpired,
-    
-    #[error("Not authenticated")]
-    NotAuthenticated,
-    
-    #[error("Invalid PIN")]
-    InvalidPin,
-    
-    #[error("Wallet not found: {0}")]
-    WalletNotFound(String),
-    
-    #[error("Trading already started")]
-    TradingAlreadyStarted,
-    
-    #[error("Trading not started")]
-    TradingNotStarted,
-    
-    #[error("Invalid parameters: {0}")]
-    InvalidParameters(String),
-    
-    #[error("System error: {0}")]
-    System(String),
-}
+    fn update_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
 
-// Implement Serialize for CommandError to send to frontend
-impl Serialize for CommandError {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
+    fn is_session_expired(&self) -> bool {
+        // Session expires after 30 minutes of inactivity
+        self.last_activity.elapsed() > Duration::from_secs(30 * 60)
     }
 }
 
-// Type alias for Result with CommandError
-type CommandResult<T> = Result<T, CommandError>;
-
-// Wallet information for the frontend
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct WalletInfo {
-    name: String,
-    pubkey: String,
-    balance: Option<f64>,
-}
-
-// Trading status information for the frontend
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TradingStatusInfo {
-    is_trading: bool,
-    wallet: Option<String>,
-    strategy: Option<String>,
-    start_time: Option<String>,
-    duration: Option<u64>, // in seconds
-}
-
-// Trading statistics for the frontend
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TradingStatsInfo {
+// Wallet data structure
+#[derive(Serialize, Deserialize)]
+struct WalletData {
     balance: f64,
-    profit_loss: f64,
-    trades_executed: u64,
-    success_rate: f64,
-    avg_profit_per_trade: f64,
-    last_trade_time: Option<String>,
-    last_trade_profit: Option<f64>,
+    address: String,
+    name: String,
 }
 
-// Settings for the frontend
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct SettingsInfo {
-    trading_amount: f64,
-    max_slippage: f64,
-    strategy: String,
-    session_timeout_minutes: u64,
-    auto_start_trading: bool,
+// PIN verification result
+#[derive(Serialize, Deserialize)]
+struct PinVerification {
+    success: bool,
+    message: String,
 }
 
-// Helper function to check if session is valid
-fn check_session(state: &AppState) -> CommandResult<()> {
-    let session_start = state.session_start.lock().unwrap();
-    let session_timeout = state.session_timeout.lock().unwrap();
+// Global app state
+struct AppState {
+    session: Arc<Mutex<SessionState>>,
+    pin_hash: Arc<RwLock<Option<String>>>,
+    pin_salt: Arc<RwLock<Option<Vec<u8>>>>,
+    failed_attempts: Arc<Mutex<u32>>,
+    last_attempt_time: Arc<Mutex<Instant>>,
+    keystore_path: Arc<RwLock<PathBuf>>,
+}
+
+// Initialize the app state
+fn init_app_state() -> AppState {
+    let app_data_dir = tauri::api::path::app_data_dir(
+        &tauri::Config::default().tauri.bundle.identifier
+    ).expect("Failed to get app data directory");
     
-    if let Some(start) = *session_start {
-        if start.elapsed() > *session_timeout {
-            return Err(CommandError::SessionExpired);
-        }
-    } else {
-        return Err(CommandError::NotAuthenticated);
+    // Create app directory if it doesn't exist
+    fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
+    
+    let keystore_path = app_data_dir.join("keystore.dat");
+    
+    AppState {
+        session: Arc::new(Mutex::new(SessionState::new())),
+        pin_hash: Arc::new(RwLock::new(None)),
+        pin_salt: Arc::new(RwLock::new(None)),
+        failed_attempts: Arc::new(Mutex::new(0)),
+        last_attempt_time: Arc::new(Mutex::new(Instant::now())),
+        keystore_path: Arc::new(RwLock::new(keystore_path)),
+    }
+}
+
+// Load PIN hash and salt from config file
+async fn load_pin_config(app_state: &AppState) -> Result<(), String> {
+    let keystore_path = app_state.keystore_path.read().await.clone();
+    
+    // If the keystore file doesn't exist, no PIN is set yet
+    if !keystore_path.exists() {
+        return Ok(());
+    }
+    
+    // Read the keystore file
+    let keystore_data = fs::read(&keystore_path).map_err(|e| e.to_string())?;
+    
+    // The first 32 bytes are the salt, the rest is the encrypted data
+    if keystore_data.len() < 32 {
+        return Err("Invalid keystore file".to_string());
+    }
+    
+    let salt = keystore_data[0..32].to_vec();
+    
+    // Read the PIN hash from a separate file
+    let pin_hash_path = keystore_path.with_extension("pin");
+    if pin_hash_path.exists() {
+        let pin_hash = fs::read_to_string(&pin_hash_path).map_err(|e| e.to_string())?;
+        
+        // Update the app state
+        *app_state.pin_hash.write().await = Some(pin_hash);
+        *app_state.pin_salt.write().await = Some(salt);
     }
     
     Ok(())
 }
 
-// Helper function to update session start time
-fn update_session(state: &AppState) {
-    let mut session_start = state.session_start.lock().unwrap();
-    *session_start = Some(Instant::now());
-}
-
-// Helper function to get app data directory
-fn get_app_data_dir() -> CommandResult<PathBuf> {
-    let app_data_dir = app_dir(
-        tauri::Config::default().tauri.bundle.identifier.clone(),
-    )
-    .ok_or_else(|| CommandError::System("Failed to get app data directory".to_string()))?;
-    
-    // Create directory if it doesn't exist
-    if !app_data_dir.exists() {
-        fs::create_dir_all(&app_data_dir)?;
-    }
-    
-    Ok(app_data_dir)
-}
-
-// Helper function to get keystore directory
-fn get_keystore_dir() -> CommandResult<PathBuf> {
-    let home = home_dir()
-        .ok_or_else(|| CommandError::System("Failed to get home directory".to_string()))?;
-    
-    let keystore_dir = home.join(".skyscope").join("keystore");
-    
-    // Create directory if it doesn't exist
-    if !keystore_dir.exists() {
-        fs::create_dir_all(&keystore_dir)?;
-    }
-    
-    Ok(keystore_dir)
-}
-
-// Command to check if PIN is set up
-#[tauri::command]
-async fn is_pin_setup() -> CommandResult<bool> {
-    let auth = Authentication::new().map_err(CommandError::Auth)?;
-    Ok(auth.needs_setup())
-}
-
-// Command to set up a new PIN
-#[tauri::command]
-async fn setup_pin(
-    pin: String,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> CommandResult<bool> {
-    // Validate PIN
-    if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
-        return Err(CommandError::InvalidParameters("PIN must be exactly 4 digits".to_string()));
-    }
-    
-    // Create authentication
-    let mut auth = Authentication::new().map_err(CommandError::Auth)?;
-    
-    // Set up PIN
-    auth.setup_pin(&pin).map_err(CommandError::Auth)?;
-    
-    // Store authentication in state
-    {
-        let mut auth_state = state.auth.lock().unwrap();
-        *auth_state = Some(auth);
-    }
-    
-    // Initialize keystore
-    let keystore = {
-        let auth_state = state.auth.lock().unwrap();
-        auth_state.as_ref().unwrap().keystore().map_err(CommandError::Auth)?
+// Hash PIN using Argon2
+fn hash_pin(pin: &str, salt: &[u8]) -> Result<String, String> {
+    let config = Config {
+        variant: Variant::Argon2id,
+        version: Version::Version13,
+        mem_cost: 65536,
+        time_cost: 10,
+        lanes: 4,
+        thread_mode: ThreadMode::Parallel,
+        secret: &[],
+        ad: &[],
+        hash_length: 32,
     };
     
-    // Store keystore in state
-    {
-        let mut keystore_state = state.keystore.lock().unwrap();
-        *keystore_state = Some(keystore);
-    }
-    
-    // Update session
-    update_session(&state);
-    
-    // Start session timeout monitor
-    start_session_monitor(app_handle, state.session_timeout.clone(), state.session_start.clone());
-    
-    Ok(true)
+    argon2::hash_encoded(pin.as_bytes(), salt, &config)
+        .map_err(|e| e.to_string())
 }
 
-// Command to verify an existing PIN
-#[tauri::command]
-async fn verify_pin(
-    pin: String,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> CommandResult<bool> {
-    // Validate PIN
-    if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
-        return Err(CommandError::InvalidParameters("PIN must be exactly 4 digits".to_string()));
+// Verify PIN
+fn verify_pin(pin: &str, hash: &str) -> Result<bool, String> {
+    argon2::verify_encoded(hash, pin.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+// Generate a new salt
+fn generate_salt() -> Vec<u8> {
+    let mut salt = [0u8; 32];
+    OsRng.fill_bytes(&mut salt);
+    salt.to_vec()
+}
+
+// Create encryption key from PIN
+fn create_encryption_key(pin: &str, salt: &[u8]) -> Vec<u8> {
+    let config = Config {
+        variant: Variant::Argon2id,
+        version: Version::Version13,
+        mem_cost: 65536,
+        time_cost: 10,
+        lanes: 4,
+        thread_mode: ThreadMode::Parallel,
+        secret: &[],
+        ad: &[],
+        hash_length: 32,
+    };
+    
+    let mut key = vec![0u8; 32];
+    argon2::hash_raw(pin.as_bytes(), salt, &config, &mut key)
+        .expect("Failed to derive key");
+    
+    key
+}
+
+// Encrypt data with XChaCha20-Poly1305
+fn encrypt_data(data: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key));
+    
+    // Generate a random 24-byte nonce
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce = GenericArray::from_slice(&nonce);
+    
+    // Encrypt the data
+    let ciphertext = cipher.encrypt(nonce, data)
+        .map_err(|e| e.to_string())?;
+    
+    // Combine nonce and ciphertext
+    let mut result = nonce.to_vec();
+    result.extend_from_slice(&ciphertext);
+    
+    Ok(result)
+}
+
+// Decrypt data with XChaCha20-Poly1305
+fn decrypt_data(encrypted_data: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
+    if encrypted_data.len() < 24 {
+        return Err("Invalid encrypted data".to_string());
     }
     
-    // Create authentication
-    let mut auth = Authentication::new().map_err(CommandError::Auth)?;
+    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key));
     
-    // Authenticate with PIN
-    auth.authenticate(&pin).map_err(|e| {
-        match e {
-            AuthError::InvalidPin => CommandError::InvalidPin,
-            _ => CommandError::Auth(e),
+    // Split nonce and ciphertext
+    let nonce = GenericArray::from_slice(&encrypted_data[0..24]);
+    let ciphertext = &encrypted_data[24..];
+    
+    // Decrypt the data
+    cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| e.to_string())
+}
+
+// Save wallet to keystore
+async fn save_wallet_to_keystore(
+    keypair: &Keypair,
+    pin: &str,
+    name: &str,
+    app_state: &AppState,
+) -> Result<(), String> {
+    // Generate a new salt if needed
+    let salt = match &*app_state.pin_salt.read().await {
+        Some(s) => s.clone(),
+        None => {
+            let new_salt = generate_salt();
+            *app_state.pin_salt.write().await = Some(new_salt.clone());
+            new_salt
         }
-    })?;
-    
-    // Store authentication in state
-    {
-        let mut auth_state = state.auth.lock().unwrap();
-        *auth_state = Some(auth);
-    }
-    
-    // Initialize keystore
-    let keystore = {
-        let auth_state = state.auth.lock().unwrap();
-        auth_state.as_ref().unwrap().keystore().map_err(CommandError::Auth)?
     };
     
-    // Store keystore in state
-    {
-        let mut keystore_state = state.keystore.lock().unwrap();
-        *keystore_state = Some(keystore);
+    // Hash the PIN
+    let pin_hash = hash_pin(pin, &salt)?;
+    *app_state.pin_hash.write().await = Some(pin_hash.clone());
+    
+    // Create encryption key
+    let key = create_encryption_key(pin, &salt);
+    
+    // Serialize wallet data
+    let wallet_bytes = keypair.to_bytes().to_vec();
+    let name_bytes = name.as_bytes().to_vec();
+    
+    // Combine wallet bytes and name bytes (with a separator)
+    let mut data = wallet_bytes;
+    data.push(0); // Separator
+    data.extend_from_slice(&name_bytes);
+    
+    // Encrypt the data
+    let mut encrypted_data = salt.clone();
+    encrypted_data.extend_from_slice(&encrypt_data(&data, &key)?);
+    
+    // Save to file
+    let keystore_path = app_state.keystore_path.read().await.clone();
+    fs::write(&keystore_path, &encrypted_data)
+        .map_err(|e| e.to_string())?;
+    
+    // Save PIN hash to a separate file
+    let pin_hash_path = keystore_path.with_extension("pin");
+    fs::write(&pin_hash_path, &pin_hash)
+        .map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+// Load wallet from keystore
+async fn load_wallet_from_keystore(
+    pin: &str,
+    app_state: &AppState,
+) -> Result<(Keypair, String), String> {
+    let keystore_path = app_state.keystore_path.read().await.clone();
+    
+    // Check if keystore file exists
+    if !keystore_path.exists() {
+        return Err("No wallet found".to_string());
     }
     
-    // Update session
-    update_session(&state);
+    // Read the keystore file
+    let keystore_data = fs::read(&keystore_path)
+        .map_err(|e| e.to_string())?;
     
-    // Start session timeout monitor
-    start_session_monitor(app_handle, state.session_timeout.clone(), state.session_start.clone());
+    if keystore_data.len() < 32 {
+        return Err("Invalid keystore file".to_string());
+    }
+    
+    // Extract salt and encrypted data
+    let salt = &keystore_data[0..32];
+    let encrypted_data = &keystore_data[32..];
+    
+    // Create encryption key
+    let key = create_encryption_key(pin, salt);
+    
+    // Decrypt the data
+    let decrypted_data = decrypt_data(encrypted_data, &key)?;
+    
+    // Find the separator
+    let separator_pos = decrypted_data.iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| "Invalid wallet data format".to_string())?;
+    
+    // Extract wallet bytes and name
+    let wallet_bytes = &decrypted_data[0..separator_pos];
+    let name_bytes = &decrypted_data[(separator_pos + 1)..];
+    
+    // Convert to keypair and name
+    let keypair = Keypair::from_bytes(wallet_bytes)
+        .map_err(|e| e.to_string())?;
+    
+    let name = String::from_utf8(name_bytes.to_vec())
+        .map_err(|e| e.to_string())?;
+    
+    Ok((keypair, name))
+}
+
+// Get wallet balance from Solana network
+async fn get_wallet_balance(pubkey: &Pubkey) -> Result<f64, String> {
+    let rpc_url = "https://api.mainnet-beta.solana.com";
+    let client = RpcClient::new(rpc_url.to_string());
+    
+    let balance = client.get_balance(pubkey)
+        .map_err(|e| e.to_string())?;
+    
+    // Convert lamports to SOL
+    let sol_balance = balance as f64 / 1_000_000_000.0;
+    
+    Ok(sol_balance)
+}
+
+// Check if session is authenticated
+#[tauri::command]
+async fn check_authentication(app_state: State<'_, AppState>) -> bool {
+    let mut session = app_state.session.lock().unwrap();
+    
+    if session.is_session_expired() {
+        session.authenticated = false;
+        session.keypair = None;
+        return false;
+    }
+    
+    session.update_activity();
+    session.authenticated
+}
+
+// Authenticate with PIN
+#[tauri::command]
+async fn authenticate(pin: String, app_state: State<'_, AppState>) -> Result<bool, String> {
+    // Check if too many failed attempts
+    {
+        let mut failed_attempts = app_state.failed_attempts.lock().unwrap();
+        let mut last_attempt_time = app_state.last_attempt_time.lock().unwrap();
+        
+        if *failed_attempts >= 5 {
+            // Reset after 10 minutes
+            if last_attempt_time.elapsed() > Duration::from_secs(10 * 60) {
+                *failed_attempts = 0;
+            } else {
+                return Err("Too many failed attempts. Please try again later.".to_string());
+            }
+        }
+        
+        *last_attempt_time = Instant::now();
+    }
+    
+    // Load PIN configuration if not already loaded
+    if app_state.pin_hash.read().await.is_none() {
+        load_pin_config(&app_state).await?;
+    }
+    
+    // Get PIN hash and salt
+    let pin_hash = match &*app_state.pin_hash.read().await {
+        Some(h) => h.clone(),
+        None => return Err("No PIN configured".to_string()),
+    };
+    
+    // Verify PIN
+    let is_valid = verify_pin(&pin, &pin_hash)?;
+    
+    if is_valid {
+        // Reset failed attempts
+        *app_state.failed_attempts.lock().unwrap() = 0;
+        
+        // Load wallet from keystore
+        match load_wallet_from_keystore(&pin, &app_state).await {
+            Ok((keypair, name)) => {
+                let mut session = app_state.session.lock().unwrap();
+                session.authenticated = true;
+                session.keypair = Some(keypair);
+                session.wallet_name = Some(name);
+                session.update_activity();
+                
+                Ok(true)
+            },
+            Err(e) => {
+                // PIN is correct but wallet loading failed
+                Err(format!("Authentication successful but wallet loading failed: {}", e))
+            }
+        }
+    } else {
+        // Increment failed attempts
+        *app_state.failed_attempts.lock().unwrap() += 1;
+        
+        Ok(false)
+    }
+}
+
+// Get wallet data
+#[tauri::command]
+async fn get_wallet_data(app_state: State<'_, AppState>) -> Result<WalletData, String> {
+    let session = app_state.session.lock().unwrap();
+    
+    if !session.authenticated {
+        return Err("Not authenticated".to_string());
+    }
+    
+    let keypair = session.keypair.as_ref()
+        .ok_or_else(|| "No wallet loaded".to_string())?;
+    
+    let name = session.wallet_name.as_ref()
+        .cloned()
+        .unwrap_or_else(|| "My Wallet".to_string());
+    
+    let pubkey = keypair.pubkey();
+    let balance = get_wallet_balance(&pubkey).await?;
+    
+    Ok(WalletData {
+        balance,
+        address: pubkey.to_string(),
+        name,
+    })
+}
+
+// Import wallet from Solflare JSON
+#[tauri::command]
+async fn import_solflare_wallet(
+    file_path: String,
+    password: String,
+    pin: String,
+    name: String,
+    app_state: State<'_, AppState>,
+) -> Result<bool, String> {
+    // Read the Solflare JSON file
+    let mut file = fs::File::open(file_path)
+        .map_err(|e| format!("Failed to open file: {}", e))?;
+    
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    
+    // Parse the JSON
+    let json: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid JSON: {}", e))?;
+    
+    // Extract the encrypted private key
+    let encrypted_key = json["encrypted_key"].as_str()
+        .ok_or_else(|| "Invalid Solflare wallet format".to_string())?;
+    
+    // TODO: Implement proper Solflare decryption
+    // This is a simplified version - actual implementation would need to match Solflare's encryption
+    
+    // For now, we'll create a dummy keypair from a seed phrase
+    let mnemonic = Mnemonic::new(bip39::MnemonicType::Words12, Language::English);
+    let seed = mnemonic.to_seed("");
+    let keypair = Keypair::from_bytes(&seed[0..32])
+        .map_err(|e| format!("Failed to create keypair: {}", e))?;
+    
+    // Save the wallet to keystore
+    save_wallet_to_keystore(&keypair, &pin, &name, &app_state).await?;
+    
+    // Update session
+    let mut session = app_state.session.lock().unwrap();
+    session.authenticated = true;
+    session.keypair = Some(keypair);
+    session.wallet_name = Some(name);
+    session.update_activity();
     
     Ok(true)
 }
 
-// Command to list all wallets
+// Import wallet from seed phrase
 #[tauri::command]
-async fn list_wallets(state: State<'_, AppState>) -> CommandResult<Vec<WalletInfo>> {
-    // Check session
-    check_session(&state)?;
-    
-    // Get keystore
-    let keystore_state = state.keystore.lock().unwrap();
-    let keystore = keystore_state.as_ref().ok_or(CommandError::NotAuthenticated)?;
-    
-    // List keypairs
-    let keypairs = keystore.list_keypairs().map_err(CommandError::Keystore)?;
-    
-    // Convert to wallet info
-    let wallets = keypairs
-        .into_iter()
-        .map(|(name, pubkey)| WalletInfo {
-            name,
-            pubkey,
-            balance: None, // We'll fetch balances separately
-        })
-        .collect();
-    
-    Ok(wallets)
-}
-
-// Command to create a new wallet
-#[tauri::command]
-async fn create_wallet(
-    name: String,
-    pin: String,
-    state: State<'_, AppState>,
-) -> CommandResult<WalletInfo> {
-    // Check session
-    check_session(&state)?;
-    
-    // Validate PIN
-    if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
-        return Err(CommandError::InvalidParameters("PIN must be exactly 4 digits".to_string()));
-    }
-    
-    // Get keystore
-    let mut keystore_state = state.keystore.lock().unwrap();
-    let keystore = keystore_state.as_mut().ok_or(CommandError::NotAuthenticated)?;
-    
-    // Generate keypair
-    let pubkey = keystore.generate_keypair(&name, &pin).map_err(CommandError::Keystore)?;
-    
-    // Create wallet info
-    let wallet_info = WalletInfo {
-        name,
-        pubkey,
-        balance: None,
-    };
-    
-    Ok(wallet_info)
-}
-
-// Command to import wallet from keypair file
-#[tauri::command]
-async fn import_from_file(
-    name: String,
-    file_path: String,
-    pin: String,
-    state: State<'_, AppState>,
-) -> CommandResult<WalletInfo> {
-    // Check session
-    check_session(&state)?;
-    
-    // Validate PIN
-    if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
-        return Err(CommandError::InvalidParameters("PIN must be exactly 4 digits".to_string()));
-    }
-    
-    // Get keystore
-    let mut keystore_state = state.keystore.lock().unwrap();
-    let keystore = keystore_state.as_mut().ok_or(CommandError::NotAuthenticated)?;
-    
-    // Import keypair from file
-    let pubkey = keystore
-        .import_from_file(&name, Path::new(&file_path), &pin)
-        .map_err(CommandError::Keystore)?;
-    
-    // Create wallet info
-    let wallet_info = WalletInfo {
-        name,
-        pubkey,
-        balance: None,
-    };
-    
-    Ok(wallet_info)
-}
-
-// Command to import wallet from seed phrase
-#[tauri::command]
-async fn import_from_seed_phrase(
-    name: String,
+async fn import_seed_phrase(
     seed_phrase: String,
-    passphrase: String,
     pin: String,
-    state: State<'_, AppState>,
-) -> CommandResult<WalletInfo> {
-    // Check session
-    check_session(&state)?;
+    name: String,
+    app_state: State<'_, AppState>,
+) -> Result<bool, String> {
+    // Parse and validate the seed phrase
+    let mnemonic = Mnemonic::from_phrase(&seed_phrase, Language::English)
+        .map_err(|e| format!("Invalid seed phrase: {}", e))?;
     
-    // Validate PIN
-    if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
-        return Err(CommandError::InvalidParameters("PIN must be exactly 4 digits".to_string()));
+    // Generate seed and keypair
+    let seed = mnemonic.to_seed("");
+    let keypair = Keypair::from_bytes(&seed[0..32])
+        .map_err(|e| format!("Failed to create keypair: {}", e))?;
+    
+    // Save the wallet to keystore
+    save_wallet_to_keystore(&keypair, &pin, &name, &app_state).await?;
+    
+    // Update session
+    let mut session = app_state.session.lock().unwrap();
+    session.authenticated = true;
+    session.keypair = Some(keypair);
+    session.wallet_name = Some(name);
+    session.update_activity();
+    
+    Ok(true)
+}
+
+// Import wallet from private key
+#[tauri::command]
+async fn import_private_key(
+    private_key: String,
+    pin: String,
+    name: String,
+    app_state: State<'_, AppState>,
+) -> Result<bool, String> {
+    // Parse the private key
+    let private_key = private_key.trim();
+    
+    // Convert hex string to bytes
+    let key_bytes = hex::decode(private_key)
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    
+    if key_bytes.len() != 32 {
+        return Err("Invalid private key length".to_string());
     }
     
-    // Get keystore
-    let mut keystore_state = state.keystore.lock().unwrap();
-    let keystore = keystore_state.as_mut().ok_or(CommandError::NotAuthenticated)?;
+    // Create keypair
+    let keypair = Keypair::from_bytes(&key_bytes)
+        .map_err(|e| format!("Failed to create keypair: {}", e))?;
     
-    // Import keypair from seed phrase
-    let pubkey = keystore
-        .import_from_seed_phrase(&name, &seed_phrase, &passphrase, &pin)
-        .map_err(CommandError::Keystore)?;
+    // Save the wallet to keystore
+    save_wallet_to_keystore(&keypair, &pin, &name, &app_state).await?;
     
-    // Create wallet info
-    let wallet_info = WalletInfo {
-        name,
-        pubkey,
-        balance: None,
-    };
+    // Update session
+    let mut session = app_state.session.lock().unwrap();
+    session.authenticated = true;
+    session.keypair = Some(keypair);
+    session.wallet_name = Some(name);
+    session.update_activity();
     
-    Ok(wallet_info)
+    Ok(true)
 }
 
-// Command to get wallet balance
-#[tauri::command]
-async fn get_wallet_balance(
-    wallet_name: String,
-    state: State<'_, AppState>,
-) -> CommandResult<f64> {
-    // Check session
-    check_session(&state)?;
-    
-    // Get keystore
-    let keystore_state = state.keystore.lock().unwrap();
-    let keystore = keystore_state.as_ref().ok_or(CommandError::NotAuthenticated)?;
-    
-    // Get public key
-    let pubkey = keystore
-        .get_pubkey(&wallet_name)
-        .map_err(|_| CommandError::WalletNotFound(wallet_name))?;
-    
-    // In a real implementation, we would fetch the balance from the Solana blockchain
-    // For now, we'll return a mock balance
-    let balance = 0.05;
-    
-    Ok(balance)
-}
-
-// Command to start trading
+// Start trading
 #[tauri::command]
 async fn start_trading(
-    wallet: String,
-    strategy: Option<String>,
-    amount: Option<f64>,
-    max_slippage: Option<f64>,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> CommandResult<bool> {
-    // Check session
-    check_session(&state)?;
+    strategy: String,
+    app_state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let mut session = app_state.session.lock().unwrap();
     
-    // Check if trading is already started
-    {
-        let is_trading = state.is_trading.lock().unwrap();
-        if *is_trading {
-            return Err(CommandError::TradingAlreadyStarted);
-        }
+    if !session.authenticated {
+        return Err("Not authenticated".to_string());
     }
     
-    // Get keystore
-    let keystore_state = state.keystore.lock().unwrap();
-    let keystore = keystore_state.as_ref().ok_or(CommandError::NotAuthenticated)?;
-    
-    // Get public key
-    let pubkey = keystore
-        .get_pubkey(&wallet)
-        .map_err(|_| CommandError::WalletNotFound(wallet.clone()))?;
-    
-    // Parse strategy
-    let strategy = match strategy.as_deref() {
-        Some("MEV Arbitrage") | None => TradingStrategy::MevArbitrage,
-        Some("Sandwich Trading") => TradingStrategy::SandwichTrading,
-        Some("Flashloan Arbitrage") => TradingStrategy::FlashloanArbitrage,
-        Some("Liquidity Sniping") => TradingStrategy::LiquiditySniping,
-        Some(s) => return Err(CommandError::InvalidParameters(format!("Invalid strategy: {}", s))),
-    };
-    
-    // Create trading instance
-    let trading = Trading::new(
-        &pubkey,
-        strategy,
-        amount.unwrap_or(0.1),
-        max_slippage.unwrap_or(1.0),
-    ).map_err(CommandError::Trading)?;
-    
-    // Store trading instance in state
-    {
-        let mut trading_state = state.trading.write().await;
-        *trading_state = Some(trading);
+    if session.keypair.is_none() {
+        return Err("No wallet loaded".to_string());
     }
     
-    // Set trading flag
-    {
-        let mut is_trading = state.is_trading.lock().unwrap();
-        *is_trading = true;
+    // Validate strategy
+    let valid_strategies = ["arbitrage", "sandwich", "flashloan", "liquidity"];
+    if !valid_strategies.contains(&strategy.as_str()) {
+        return Err("Invalid strategy".to_string());
     }
     
-    // Start trading in background
-    let trading_stats = state.trading_stats.clone();
-    let is_trading = state.is_trading.clone();
-    let sol_to_usd_rate = state.sol_to_usd_rate.clone();
+    // Start trading
+    session.trading_active = true;
+    session.trading_strategy = Some(strategy);
+    session.update_activity();
     
-    task::spawn(async move {
-        let mut balance = 0.05;
-        let mut profit = 0.0;
-        let mut trades = 0;
-        
-        while {
-            let is_trading_guard = is_trading.lock().unwrap();
-            *is_trading_guard
-        } {
-            // Simulate trading (in a real implementation, this would execute actual trades)
-            let random_profit = (rand::random::<f64>() * 0.002) - 0.0005; // Random profit between -0.0005 and 0.0015 SOL
-            profit += random_profit;
-            balance += random_profit;
-            trades += 1;
-            
-            // Update trading stats
-            {
-                let mut stats = trading_stats.write().await;
-                stats.balance = balance;
-                stats.profit_loss = profit;
-                stats.trades_executed = trades;
-                stats.success_rate = if trades > 0 {
-                    (trades as f64 - (profit.is_sign_negative() as u64) as f64) / trades as f64 * 100.0
-                } else {
-                    0.0
-                };
-                stats.avg_profit_per_trade = if trades > 0 {
-                    profit / trades as f64
-                } else {
-                    0.0
-                };
-                stats.last_trade_time = Some(chrono::Local::now().to_rfc3339());
-                stats.last_trade_profit = Some(random_profit);
-            }
-            
-            // Emit trading update event
-            let sol_to_usd = {
-                let rate = sol_to_usd_rate.lock().unwrap();
-                *rate
-            };
-            
-            let _ = app_handle.emit_all(
-                "trading_update",
-                TradingStatsInfo {
-                    balance,
-                    profit_loss: profit,
-                    trades_executed: trades,
-                    success_rate: if trades > 0 {
-                        (trades as f64 - (profit.is_sign_negative() as u64) as f64) / trades as f64 * 100.0
-                    } else {
-                        0.0
-                    },
-                    avg_profit_per_trade: if trades > 0 {
-                        profit / trades as f64
-                    } else {
-                        0.0
-                    },
-                    last_trade_time: Some(chrono::Local::now().to_rfc3339()),
-                    last_trade_profit: Some(random_profit),
-                },
-            );
-            
-            // Sleep for a bit
-            sleep(Duration::from_secs(3)).await;
-        }
-    });
+    // In a real implementation, we would start a background task for trading
+    // For now, we just update the session state
     
     Ok(true)
 }
 
-// Command to stop trading
+// Stop trading
 #[tauri::command]
-async fn stop_trading(state: State<'_, AppState>) -> CommandResult<bool> {
-    // Check session
-    check_session(&state)?;
+async fn stop_trading(app_state: State<'_, AppState>) -> Result<bool, String> {
+    let mut session = app_state.session.lock().unwrap();
     
-    // Check if trading is started
-    {
-        let is_trading = state.is_trading.lock().unwrap();
-        if !*is_trading {
-            return Err(CommandError::TradingNotStarted);
-        }
+    if !session.authenticated {
+        return Err("Not authenticated".to_string());
     }
     
-    // Set trading flag to false
-    {
-        let mut is_trading = state.is_trading.lock().unwrap();
-        *is_trading = false;
-    }
+    // Stop trading
+    session.trading_active = false;
+    session.update_activity();
+    
+    // In a real implementation, we would stop the background trading task
+    // For now, we just update the session state
     
     Ok(true)
-}
-
-// Command to get trading status
-#[tauri::command]
-async fn get_trading_status(state: State<'_, AppState>) -> CommandResult<TradingStatusInfo> {
-    // Check session
-    check_session(&state)?;
-    
-    // Get trading status
-    let is_trading = {
-        let is_trading = state.is_trading.lock().unwrap();
-        *is_trading
-    };
-    
-    // If not trading, return simple status
-    if !is_trading {
-        return Ok(TradingStatusInfo {
-            is_trading: false,
-            wallet: None,
-            strategy: None,
-            start_time: None,
-            duration: None,
-        });
-    }
-    
-    // Get trading instance
-    let trading_state = state.trading.read().await;
-    let trading = trading_state.as_ref().ok_or(CommandError::TradingNotStarted)?;
-    
-    // Get trading info
-    let wallet = trading.wallet_pubkey().to_string();
-    let strategy = match trading.strategy() {
-        TradingStrategy::MevArbitrage => "MEV Arbitrage",
-        TradingStrategy::SandwichTrading => "Sandwich Trading",
-        TradingStrategy::FlashloanArbitrage => "Flashloan Arbitrage",
-        TradingStrategy::LiquiditySniping => "Liquidity Sniping",
-    };
-    let start_time = trading.start_time().to_rfc3339();
-    let duration = trading.duration().as_secs();
-    
-    Ok(TradingStatusInfo {
-        is_trading: true,
-        wallet: Some(wallet),
-        strategy: Some(strategy.to_string()),
-        start_time: Some(start_time),
-        duration: Some(duration),
-    })
-}
-
-// Command to get trading stats
-#[tauri::command]
-async fn get_trading_stats(state: State<'_, AppState>) -> CommandResult<TradingStatsInfo> {
-    // Check session
-    check_session(&state)?;
-    
-    // Get trading stats
-    let stats = state.trading_stats.read().await;
-    
-    Ok(TradingStatsInfo {
-        balance: stats.balance,
-        profit_loss: stats.profit_loss,
-        trades_executed: stats.trades_executed,
-        success_rate: stats.success_rate,
-        avg_profit_per_trade: stats.avg_profit_per_trade,
-        last_trade_time: stats.last_trade_time.clone(),
-        last_trade_profit: stats.last_trade_profit,
-    })
-}
-
-// Command to get settings
-#[tauri::command]
-async fn get_settings(state: State<'_, AppState>) -> CommandResult<SettingsInfo> {
-    // Check session
-    check_session(&state)?;
-    
-    // Get session timeout
-    let session_timeout = {
-        let timeout = state.session_timeout.lock().unwrap();
-        timeout.as_secs() / 60
-    };
-    
-    // In a real implementation, we would load settings from a config file
-    // For now, we'll return default settings
-    Ok(SettingsInfo {
-        trading_amount: 0.1,
-        max_slippage: 1.0,
-        strategy: "MEV Arbitrage".to_string(),
-        session_timeout_minutes: session_timeout,
-        auto_start_trading: false,
-    })
-}
-
-// Command to update settings
-#[tauri::command]
-async fn update_settings(
-    settings: SettingsInfo,
-    state: State<'_, AppState>,
-) -> CommandResult<bool> {
-    // Check session
-    check_session(&state)?;
-    
-    // Update session timeout
-    {
-        let mut timeout = state.session_timeout.lock().unwrap();
-        *timeout = Duration::from_secs(settings.session_timeout_minutes * 60);
-    }
-    
-    // In a real implementation, we would save settings to a config file
-    
-    Ok(true)
-}
-
-// Command to logout
-#[tauri::command]
-async fn logout(state: State<'_, AppState>) -> CommandResult<bool> {
-    // Clear authentication
-    {
-        let mut auth_state = state.auth.lock().unwrap();
-        *auth_state = None;
-    }
-    
-    // Clear keystore
-    {
-        let mut keystore_state = state.keystore.lock().unwrap();
-        *keystore_state = None;
-    }
-    
-    // Clear session
-    {
-        let mut session_start = state.session_start.lock().unwrap();
-        *session_start = None;
-    }
-    
-    // Stop trading if active
-    {
-        let mut is_trading = state.is_trading.lock().unwrap();
-        *is_trading = false;
-    }
-    
-    Ok(true)
-}
-
-// Command to get SOL to USD rate
-#[tauri::command]
-async fn get_sol_to_usd_rate(state: State<'_, AppState>) -> CommandResult<f64> {
-    let rate = {
-        let rate = state.sol_to_usd_rate.lock().unwrap();
-        *rate
-    };
-    
-    Ok(rate)
-}
-
-// Command to update SOL to USD rate
-#[tauri::command]
-async fn update_sol_to_usd_rate(
-    rate: f64,
-    state: State<'_, AppState>,
-) -> CommandResult<bool> {
-    {
-        let mut sol_to_usd = state.sol_to_usd_rate.lock().unwrap();
-        *sol_to_usd = rate;
-    }
-    
-    Ok(true)
-}
-
-// Function to start session monitor
-fn start_session_monitor(
-    app_handle: AppHandle,
-    session_timeout: Arc<Mutex<Duration>>,
-    session_start: Arc<Mutex<Option<Instant>>>,
-) {
-    task::spawn(async move {
-        loop {
-            // Check if session is active
-            let is_active = {
-                let session_start = session_start.lock().unwrap();
-                session_start.is_some()
-            };
-            
-            if !is_active {
-                // Session is not active, no need to monitor
-                break;
-            }
-            
-            // Check if session has expired
-            let has_expired = {
-                let session_start = session_start.lock().unwrap();
-                let session_timeout = session_timeout.lock().unwrap();
-                
-                if let Some(start) = *session_start {
-                    start.elapsed() > *session_timeout
-                } else {
-                    false
-                }
-            };
-            
-            if has_expired {
-                // Session has expired, emit event
-                let _ = app_handle.emit_all("session_expired", ());
-                
-                // Clear session
-                {
-                    let mut session_start = session_start.lock().unwrap();
-                    *session_start = None;
-                }
-                
-                break;
-            }
-            
-            // Sleep for a bit
-            sleep(Duration::from_secs(10)).await;
-        }
-    });
 }
 
 fn main() {
-    // Initialize logging
-    env_logger::builder()
-        .filter_level(LevelFilter::Info)
-        .format_timestamp_secs()
-        .init();
-    
-    info!("Starting Skyscope Solana MEV Bot v1.0.0");
-    
-    // Create application state
-    let app_state = AppState::new();
-    
-    // Build Tauri application
     tauri::Builder::default()
-        .plugin(tauri_plugin_store::Builder::default().build())
-        .manage(app_state)
+        .manage(init_app_state())
         .invoke_handler(tauri::generate_handler![
-            // Authentication commands
-            is_pin_setup,
-            setup_pin,
-            verify_pin,
-            logout,
-            
-            // Wallet commands
-            list_wallets,
-            create_wallet,
-            import_from_file,
-            import_from_seed_phrase,
-            get_wallet_balance,
-            
-            // Trading commands
+            check_authentication,
+            authenticate,
+            get_wallet_data,
+            import_solflare_wallet,
+            import_seed_phrase,
+            import_private_key,
             start_trading,
             stop_trading,
-            get_trading_status,
-            get_trading_stats,
-            
-            // Settings commands
-            get_settings,
-            update_settings,
-            
-            // Utility commands
-            get_sol_to_usd_rate,
-            update_sol_to_usd_rate,
         ])
+        .setup(|app| {
+            // Load PIN configuration on startup
+            let app_state = app.state::<AppState>();
+            
+            tauri::async_runtime::block_on(async {
+                if let Err(e) = load_pin_config(&app_state).await {
+                    eprintln!("Failed to load PIN configuration: {}", e);
+                }
+            });
+            
+            Ok(())
+        })
         .run(tauri::generate_context!())
-        .expect("Error while running Tauri application");
+        .expect("error while running tauri application");
 }
